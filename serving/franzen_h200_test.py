@@ -618,6 +618,8 @@ def test_readiness_does_not_stop_supervision_or_gpu_metrics(
     health_urls: list[str] = []
     metrics_started = threading.Event()
     metrics_stopped = threading.Event()
+    metrics_was_live_for_group_cleanup: list[bool] = []
+    group_alive = [True]
 
     class Ready:
         status = 200
@@ -630,6 +632,13 @@ def test_readiness_does_not_stop_supervision_or_gpu_metrics(
 
     monkeypatch.setattr(franzen_h200.subprocess, "Popen", lambda *args, **kwargs: process)
     monkeypatch.setattr(franzen_h200, "_query_gpu", lambda: [])
+    monkeypatch.setattr(franzen_h200, "_process_group_exists", lambda _process: group_alive[0])
+
+    def signal_group(_process, _sig: signal.Signals) -> None:
+        metrics_was_live_for_group_cleanup.append(not metrics_stopped.is_set())
+        group_alive[0] = False
+
+    monkeypatch.setattr(franzen_h200, "_signal_process_group", signal_group)
     monkeypatch.setattr(
         franzen_h200,
         "_record_gpu_metrics",
@@ -660,6 +669,7 @@ def test_readiness_does_not_stop_supervision_or_gpu_metrics(
     assert process.waited
     assert metrics_started.is_set()
     assert metrics_stopped.is_set()
+    assert metrics_was_live_for_group_cleanup == [True]
 
 
 def test_cancellation_reaps_the_owned_process_and_cancels_precache(

@@ -1351,25 +1351,27 @@ def _launch_and_wait(
         raise
     finally:
         precache_cancel.set()
-        stop_metrics.set()
-        if metrics_started and metrics_thread is not None:
-            metrics_thread.join(timeout=5)
-        if process is not None:
-            group_survivors = _terminate_process_group(process)
-            try:
-                return_code = process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                _signal_process_group(process, signal.SIGKILL)
-                return_code = process.wait()
-            _write_json(
-                paths.pid_file,
-                {
-                    "pid": process.pid,
-                    "status": "group_survivors" if group_survivors else "reaped",
-                    "returncode": return_code,
-                    "group_survivors": group_survivors,
-                },
-            )
+        try:
+            if process is not None:
+                group_survivors = _terminate_process_group(process)
+                try:
+                    return_code = process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    _signal_process_group(process, signal.SIGKILL)
+                    return_code = process.wait()
+                _write_json(
+                    paths.pid_file,
+                    {
+                        "pid": process.pid,
+                        "status": "group_survivors" if group_survivors else "reaped",
+                        "returncode": return_code,
+                        "group_survivors": group_survivors,
+                    },
+                )
+        finally:
+            stop_metrics.set()
+            if metrics_started and metrics_thread is not None:
+                metrics_thread.join(timeout=5)
     assert process is not None
     result = {
         "status": status,
