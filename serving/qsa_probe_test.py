@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
 from serving.qsa_probe.runner import (
     _require_bad_control_rejected,
     _valid_prefix_counts,
+    _valid_selection_counts,
+    _validate_vendor_file,
     _write_failure_diagnostic,
     main,
     probe_case_specs,
@@ -22,6 +25,7 @@ def test_probe_matrix_covers_decode_target_verify_draft_and_empty_mask() -> None
         ("decode-one", 1, "forward_decode"),
         ("target-verify-four", 4, "forward_extend"),
         ("draft-decode-four", 4, "forward_decode"),
+        ("mtp-shared-hole", 1, "forward_decode"),
     ]
     assert (-1, -1, -1, -1, -1) in cases[1].selected_indices
     assert any(
@@ -33,15 +37,42 @@ def test_probe_matrix_covers_decode_target_verify_draft_and_empty_mask() -> None
         )
         for index in row
     )
+    fixture_cases = [case for case in cases if case.producer == "fixture"]
     assert [
         _valid_prefix_counts(case.sequence_lengths, case.selected_indices)
-        for case in cases
+        for case in fixture_cases
     ] == [(3,), (3, 4, 0, 4), (3, 4, 5, 3)]
+    mtp_case = next(case for case in cases if case.producer == "mtp_shared_indices")
+    assert mtp_case.selected_indices == ((0, 1, -1, -1, -1, 2, -1),)
+    assert _valid_selection_counts(mtp_case.sequence_lengths, mtp_case.selected_indices) == (3,)
+    with pytest.raises(ValueError, match="valid indices must be a prefix"):
+        _valid_prefix_counts(mtp_case.sequence_lengths, mtp_case.selected_indices)
+
+
+def test_probe_has_mutable_graph_replay_case_for_mtp_shared_tail() -> None:
+    case = next(case for case in probe_case_specs() if case.producer == "mtp_shared_indices")
+
+    assert case.graph_replay is True
+    assert case.mtp_capture_indices == (0, 1, -1, -1, -1)
+    assert case.mtp_captured_length == 2
+    assert case.sequence_lengths == (3,)
+    assert case.selected_indices == ((0, 1, -1, -1, -1, 2, -1),)
+    assert _valid_selection_counts(case.sequence_lengths, case.selected_indices) == (3,)
 
 
 def test_probe_mask_contract_rejects_valid_index_after_invalid_slot() -> None:
     with pytest.raises(ValueError, match="valid indices must be a prefix"):
         _valid_prefix_counts((5,), ((0, -1, 2, 4, 5),))
+
+
+def test_probe_accepts_the_source_pinned_mtp_hole_patch(tmp_path) -> None:
+    from serving.franzen_h200 import _apply_qsa_mtp_hole_patch_text
+
+    fixture = Path(__file__).parent / "fixtures/qwen_sparse_attn_backend-v1.py.txt"
+    vendor_file = tmp_path / "qwen_sparse_attn_backend.py"
+    vendor_file.write_text(_apply_qsa_mtp_hole_patch_text(fixture.read_text()))
+
+    _validate_vendor_file(vendor_file)
 
 
 def test_probe_requires_explicit_execution_flag(capsys: pytest.CaptureFixture[str]) -> None:

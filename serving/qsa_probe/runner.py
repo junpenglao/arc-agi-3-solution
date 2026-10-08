@@ -8,9 +8,12 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Protocol, cast
+from typing import Literal, Protocol, cast
 
-from serving.franzen_h200 import QSA_FP8_PATCH_AFTER_SHA256
+from serving.franzen_h200 import (
+    QSA_FP8_PATCH_AFTER_SHA256,
+    QSA_MTP_HOLE_AFTER_SHA256,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,6 +22,10 @@ class ProbeCase:
     sequence_lengths: tuple[int, ...]
     selected_indices: tuple[tuple[int, ...], ...]
     caller: str
+    producer: Literal["fixture", "mtp_shared_indices"] = "fixture"
+    graph_replay: bool = False
+    mtp_capture_indices: tuple[int, ...] = ()
+    mtp_captured_length: int = 0
 
     @property
     def query_rows(self) -> int:
@@ -86,6 +93,16 @@ def probe_case_specs() -> tuple[ProbeCase, ...]:
             ),
             caller="forward_decode",
         ),
+        ProbeCase(
+            name="mtp-shared-hole",
+            sequence_lengths=(3,),
+            selected_indices=((0, 1, -1, -1, -1, 2, -1),),
+            caller="forward_decode",
+            producer="mtp_shared_indices",
+            graph_replay=True,
+            mtp_capture_indices=(0, 1, -1, -1, -1),
+            mtp_captured_length=2,
+        ),
     )
 
 
@@ -93,9 +110,8 @@ def _valid_prefix_counts(
     sequence_lengths: tuple[int, ...],
     selected_indices: tuple[tuple[int, ...], ...],
 ) -> tuple[int, ...]:
-    counts: list[int] = []
+    counts = _valid_selection_counts(sequence_lengths, selected_indices)
     for sequence_length, row_indices in zip(sequence_lengths, selected_indices, strict=True):
-        valid_count = 0
         invalid_seen = False
         for index in row_indices:
             if 0 <= index < sequence_length:
@@ -104,11 +120,23 @@ def _valid_prefix_counts(
                         "QSA selected indices must be valid indices first; "
                         "valid indices must be a prefix of each row",
                     )
-                valid_count += 1
             else:
                 invalid_seen = True
-        counts.append(valid_count)
     return tuple(counts)
+
+
+def _valid_selection_counts(
+    sequence_lengths: tuple[int, ...],
+    selected_indices: tuple[tuple[int, ...], ...],
+) -> tuple[int, ...]:
+    return tuple(
+        sum(0 <= index < sequence_length for index in row_indices)
+        for sequence_length, row_indices in zip(
+            sequence_lengths,
+            selected_indices,
+            strict=True,
+        )
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -132,9 +160,9 @@ def main(argv: list[str] | None = None) -> int:
 
 def _validate_vendor_file(path: Path) -> None:
     digest = _sha256(path)
-    if digest != QSA_FP8_PATCH_AFTER_SHA256:
+    if digest not in (QSA_FP8_PATCH_AFTER_SHA256, QSA_MTP_HOLE_AFTER_SHA256):
         raise ValueError(
-            "The probe requires the explicit QSA scratch patch; "
+            "The probe requires the explicit QSA compatibility patch; "
             f"vendor source SHA-256 is {digest}",
         )
 
@@ -182,6 +210,7 @@ def _run_probe(vendor_file: Path, *, diagnostic_output: Path) -> dict[str, objec
             "initial_value_cache": initial_value,
             "case_sequence_lengths": list(case.sequence_lengths),
             "case_selected_indices": [list(row) for row in case.selected_indices],
+            "producer": case.producer,
         }
         try:
             output, selected = _run_case(
@@ -234,6 +263,16 @@ def _run_probe(vendor_file: Path, *, diagnostic_output: Path) -> dict[str, objec
                 "masked_counts": selected["valid_counts"].cpu().tolist(),
             },
         )
+    mtp_graph_replay = _run_mtp_shared_graph_replay(
+        torch=torch,
+        qsa=qsa,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        case=next(case for case in probe_case_specs() if case.graph_replay),
+        diagnostic_output=diagnostic_output,
+        vendor_file=module_path,
+        gpu={"name": device_name, "capability": list(capability)},
+    )
     if not torch.equal(key_cache, initial_key) or not torch.equal(value_cache, initial_value):
         raise AssertionError("QSA gather modified the persistent FP8 K/V pool")
     bad_control = _known_bad_fp8_scratch_control(
@@ -245,15 +284,20 @@ def _run_probe(vendor_file: Path, *, diagnostic_output: Path) -> dict[str, objec
     )
     _require_bad_control_rejected(bad_control)
     return {
-        "schema": "franzen-qsa-sm90-fp8-scratch-probe.v1",
+        "schema": "franzen-qsa-sm90-fp8-scratch-probe.v2",
         "vendor_file": str(module_path),
         "vendor_sha256": _sha256(module_path),
+        "qsa_compatibility_patches": {
+            "fp8_compute_scratch_after_sha256": QSA_FP8_PATCH_AFTER_SHA256,
+            "mtp_hole_compaction_after_sha256": QSA_MTP_HOLE_AFTER_SHA256,
+        },
         "gpu": {"name": device_name, "capability": list(capability)},
         "pool_dtype": str(key_cache.dtype),
         "ssm_or_weights_changed": False,
         "nonunit_scale_refused": nonunit_scale_refused,
         "persistent_fp8_pool_unchanged": True,
         "cases": result_rows,
+        "mtp_shared_graph_replay": mtp_graph_replay,
         "known_bad_raw_fp8_scratch_control": bad_control,
     }
 
@@ -268,7 +312,7 @@ def _run_case(
     value_cache,
     diagnostics: dict[str, object],
 ) -> tuple[object, dict[str, object]]:
-    expected_valid_counts = _valid_prefix_counts(
+    expected_valid_counts = _valid_selection_counts(
         case.sequence_lengths,
         case.selected_indices,
     )
@@ -285,8 +329,34 @@ def _run_case(
         .to(device="cuda", dtype=torch.bfloat16)
     )
     sequence_lengths = torch.tensor(case.sequence_lengths, dtype=torch.int32, device="cuda")
-    indices = torch.tensor(case.selected_indices, dtype=torch.int32, device="cuda")
     row_requests = torch.zeros(query_rows, dtype=torch.int32, device="cuda")
+    if case.producer == "mtp_shared_indices":
+        mtp_state = qsa.QSAMTPSharedSparseIndices(
+            layer_ids=[0],
+            num_requests=1,
+            token_topk=len(case.mtp_capture_indices),
+            tail_width=len(case.selected_indices[0]) - len(case.mtp_capture_indices),
+            device=queries.device,
+        )
+        mtp_state.capture(
+            torch.tensor([case.mtp_capture_indices], dtype=torch.int32, device="cuda"),
+            row_requests,
+            torch.tensor([case.mtp_captured_length], dtype=torch.int32, device="cuda"),
+            0,
+        )
+        indices = mtp_state.lookup(
+            row_requests,
+            torch.tensor(
+                [case.sequence_lengths[0] - 1],
+                dtype=torch.int32,
+                device="cuda",
+            ),
+            0,
+        )
+        if tuple(tuple(row) for row in indices.cpu().tolist()) != case.selected_indices:
+            raise AssertionError("QSA MTP lookup differs from the published hole fixture")
+    else:
+        indices = torch.tensor(case.selected_indices, dtype=torch.int32, device="cuda")
     req_to_token = torch.arange(max_context, dtype=torch.int32, device="cuda").reshape(1, -1)
     metadata = SimpleNamespace(
         sequence_lengths=sequence_lengths,
@@ -385,6 +455,201 @@ def _run_case(
         "scratch_k": scratch_k,
         "scratch_v": scratch_v,
         "scale": layer.scaling,
+    }
+
+
+def _run_mtp_shared_graph_replay(
+    *,
+    torch,
+    qsa,
+    key_cache,
+    value_cache,
+    case: ProbeCase,
+    diagnostic_output: Path,
+    vendor_file: Path,
+    gpu: dict[str, object],
+) -> dict[str, object]:
+    query_heads = 2
+    kv_heads = 1
+    head_dim = 64
+    req_rows = torch.zeros(1, dtype=torch.int32, device="cuda")
+    current_positions = torch.tensor([2], dtype=torch.int32, device="cuda")
+    sequence_lengths = torch.tensor([3], dtype=torch.int32, device="cuda")
+    valid_counts = torch.empty(1, dtype=torch.int32, device="cuda")
+    cu_seqlens_k = torch.empty(2, dtype=torch.int32, device="cuda")
+    cu_seqlens_q = torch.arange(2, dtype=torch.int32, device="cuda")
+    metadata = SimpleNamespace(
+        sequence_lengths=sequence_lengths,
+        row_req_pool_indices=req_rows,
+        is_cuda_graph=True,
+        fa2_valid_counts=valid_counts,
+        fa2_cu_seqlens_k=cu_seqlens_k,
+        fa2_cu_seqlens_q=cu_seqlens_q,
+    )
+    backend = qsa.QwenSparseAttnBackend.__new__(qsa.QwenSparseAttnBackend)
+    backend.token_to_kv_pool = _Pool(key_cache, value_cache)
+    backend.req_to_token_pool = SimpleNamespace(
+        req_to_token=torch.arange(key_cache.shape[0], dtype=torch.int32, device="cuda").reshape(1, -1),
+    )
+    backend.forward_metadata = metadata
+    backend._cuda_graph_max_tokens = 1
+    backend._fa2_scratch = {}
+    mtp_state = qsa.QSAMTPSharedSparseIndices(
+        layer_ids=[0],
+        num_requests=1,
+        token_topk=len(case.mtp_capture_indices),
+        tail_width=len(case.selected_indices[0]) - len(case.mtp_capture_indices),
+        device=torch.device("cuda"),
+    )
+    mtp_state.capture(
+        torch.tensor([case.mtp_capture_indices], dtype=torch.int32, device="cuda"),
+        req_rows,
+        torch.tensor([case.mtp_captured_length], dtype=torch.int32, device="cuda"),
+        0,
+    )
+    queries = (
+        torch.arange(query_heads * head_dim, dtype=torch.float32)
+        .reshape(1, query_heads, head_dim)
+        .sub(64)
+        .div(64)
+        .to(device="cuda", dtype=torch.bfloat16)
+    )
+    forward_batch = SimpleNamespace(
+        req_pool_indices=req_rows,
+        forward_mode=None,
+        out_cache_loc=torch.zeros(1, dtype=torch.int64, device="cuda"),
+    )
+    layer = SimpleNamespace(
+        layer_id=0,
+        tp_q_head_num=query_heads,
+        head_dim=head_dim,
+        scaling=head_dim**-0.5,
+    )
+    graph = torch.cuda.CUDAGraph()
+    torch.cuda.synchronize()
+    graph_evidence: dict[str, object] = {
+        "producer": "QSAMTPSharedSparseIndices.lookup",
+        "initial_key_cache": key_cache.clone(),
+        "initial_value_cache": value_cache.clone(),
+        "queries": queries,
+        "query_scale": layer.scaling,
+        "persistent_key_cache": key_cache,
+        "persistent_value_cache": value_cache,
+        "current_positions": current_positions,
+        "sequence_lengths": sequence_lengths,
+        "valid_counts": valid_counts,
+        "cu_seqlens_k": cu_seqlens_k,
+        "cu_seqlens_q": cu_seqlens_q,
+    }
+    try:
+        with torch.cuda.graph(graph):
+            graph_indices = mtp_state.lookup(req_rows, current_positions, 0)
+            graph_output = backend.forward_decode(
+                queries,
+                key_cache[:1],
+                value_cache[:1],
+                layer,
+                forward_batch,
+                save_kv_cache=False,
+                topk_indices=graph_indices,
+            )
+    except Exception as error:
+        _write_failure_diagnostic(
+            diagnostic_output,
+            vendor_file=str(vendor_file),
+            vendor_sha256=_sha256(vendor_file),
+            gpu=gpu,
+            case=case.name,
+            error=error,
+            evidence=_snapshot_evidence(torch, graph_evidence),
+        )
+        raise
+
+    replay_rows = []
+    replay_inputs = (
+        (2, 3, (0, 1, -1, -1, -1, 2, -1)),
+        (3, 4, (0, 1, -1, -1, -1, 2, 3)),
+    )
+    for position, sequence_length, expected_indices in replay_inputs:
+        replay_case = ProbeCase(
+            name=f"mtp-shared-replay-position-{position}",
+            sequence_lengths=(sequence_length,),
+            selected_indices=(expected_indices,),
+            caller="forward_decode",
+            producer="mtp_shared_indices",
+        )
+        try:
+            current_positions.fill_(position)
+            sequence_lengths.fill_(sequence_length)
+            graph.replay()
+            torch.cuda.synchronize()
+            actual_indices = tuple(tuple(row) for row in graph_indices.cpu().tolist())
+            output = graph_output.reshape_as(queries).clone()
+            reference = _bf16_attention_reference(
+                torch=torch,
+                queries=queries,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                sequence_lengths=replay_case.sequence_lengths,
+                selected_indices=replay_case.selected_indices,
+                scale=layer.scaling,
+            )
+            selected_count = _valid_selection_counts(
+                replay_case.sequence_lengths,
+                replay_case.selected_indices,
+            )[0]
+            scratch_key = (kv_heads, head_dim, queries.dtype, queries.device)
+            scratch_k, scratch_v = backend._fa2_scratch[scratch_key]
+            selected = {
+                "scratch_k": scratch_k[:selected_count].clone(),
+                "scratch_v": scratch_v[:selected_count].clone(),
+            }
+            graph_evidence.update(
+                {
+                    "current_positions": current_positions,
+                    "sequence_lengths": sequence_lengths,
+                    "indices_from_actual_mtp_lookup": graph_indices,
+                    "expected_indices": [list(expected_indices)],
+                    "scratch_k": selected["scratch_k"],
+                    "scratch_v": selected["scratch_v"],
+                    "output": output,
+                    "reference": reference,
+                    "gather_verified": False,
+                },
+            )
+            if actual_indices != (expected_indices,):
+                raise AssertionError(
+                    f"MTP shared lookup replay differs at position {position}: {actual_indices}",
+                )
+            _assert_gathered_scratch(torch, selected, key_cache, value_cache, replay_case)
+            graph_evidence["gather_verified"] = True
+            max_abs_error = float((output.float() - reference.float()).abs().max())
+            graph_evidence["max_abs_error"] = max_abs_error
+            torch.testing.assert_close(output, reference, rtol=0.04, atol=0.04)
+        except Exception as error:
+            _write_failure_diagnostic(
+                diagnostic_output,
+                vendor_file=str(vendor_file),
+                vendor_sha256=_sha256(vendor_file),
+                gpu=gpu,
+                case=case.name,
+                error=error,
+                evidence=_snapshot_evidence(torch, graph_evidence),
+            )
+            raise
+        replay_rows.append(
+            {
+                "position": position,
+                "sequence_length": sequence_length,
+                "indices": list(expected_indices),
+                "valid_count": selected_count,
+                "output_max_abs_error": max_abs_error,
+            },
+        )
+    return {
+        "source": "QSAMTPSharedSparseIndices.lookup inside captured CUDA graph",
+        "graph_replayed_after_position_and_sequence_length_mutation": True,
+        "replays": replay_rows,
     }
 
 
@@ -525,10 +790,14 @@ def _write_failure_diagnostic(
     evidence: dict[str, object],
 ) -> None:
     receipt = {
-        "schema": "franzen-qsa-sm90-fp8-scratch-probe.v1",
+        "schema": "franzen-qsa-sm90-fp8-scratch-probe.v2",
         "status": "failed",
         "vendor_file": vendor_file,
         "vendor_sha256": vendor_sha256,
+        "qsa_compatibility_patches": {
+            "fp8_compute_scratch_after_sha256": QSA_FP8_PATCH_AFTER_SHA256,
+            "mtp_hole_compaction_after_sha256": QSA_MTP_HOLE_AFTER_SHA256,
+        },
         "gpu": gpu,
         "case": case,
         "failure": {"type": type(error).__name__, "message": str(error)},

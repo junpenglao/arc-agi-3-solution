@@ -50,6 +50,8 @@ GROUP_KILL_WAIT_SECONDS = 10
 GROUP_POLL_INTERVAL_SECONDS = 0.1
 QSA_FP8_PATCH_BEFORE_SHA256 = "2ce24d66d6a0bff0e22ff0819291649a4169937f32c5c28241215c6eb119ad54"
 QSA_FP8_PATCH_AFTER_SHA256 = "e5e08c37c603b2977d4b93ce1395185bc595be029ed5cb84ee976f3acb221d2c"
+QSA_MTP_HOLE_BEFORE_SHA256 = QSA_FP8_PATCH_AFTER_SHA256
+QSA_MTP_HOLE_AFTER_SHA256 = "9c85322f77cdfa272e54d4ff05d82b0f570c548578dbf87c40366b288afa414b"
 _QSA_FORWARD_EXTEND_ANCHOR = "    def forward_extend(\n"
 _QSA_FORWARD_EXTEND_REPLACEMENT = '''    @staticmethod
     def _require_unit_qsa_kv_scales(kwargs):
@@ -96,6 +98,21 @@ _QSA_SCRATCH_REPLACEMENT = '''        packed_k, packed_v = self._get_fa2_scratch
 '''
 
 
+_QSA_MTP_HOLE_ANCHOR = '''        flash_attn_varlen_func = _resolve_flash_attn_varlen_func()
+        batch, topk = topk_indices.shape
+'''
+_QSA_MTP_HOLE_REPLACEMENT = '''        batch, topk = topk_indices.shape
+        columns = torch.arange(topk, device=topk_indices.device)
+        invalid = (topk_indices < 0) | (
+            topk_indices >= metadata.sequence_lengths.unsqueeze(1)
+        )
+        sort_keys = columns + invalid.to(columns.dtype) * topk
+        order = torch.argsort(sort_keys, dim=1)
+        topk_indices = topk_indices.gather(1, order).contiguous()
+        flash_attn_varlen_func = _resolve_flash_attn_varlen_func()
+'''
+
+
 class Flags(Protocol):
     """Parsed launcher arguments."""
 
@@ -108,6 +125,7 @@ class Flags(Protocol):
     notebook_start_epoch: float | None
     prepare_only: bool
     qsa_fp8_compute_scratch: bool
+    qsa_mtp_hole_compaction: bool
     bind_host: str
     linear_attn_verify_backend: Literal["triton"] | None
 
@@ -459,11 +477,13 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=(__doc__ or "").strip())
     _add_arguments(parser)
     flags = cast(Flags, parser.parse_args(argv))
+    if flags.qsa_mtp_hole_compaction and not flags.qsa_fp8_compute_scratch:
+        raise ValueError("QSA MTP hole compaction requires --qsa-fp8-compute-scratch")
     paths = _resolve_paths(flags)
     paths.work_dir.mkdir(parents=True, exist_ok=True)
     runtime_environment = h200_environment(base=dict(os.environ))
     if flags.prepare_only:
-        if flags.qsa_fp8_compute_scratch:
+        if flags.qsa_fp8_compute_scratch or flags.qsa_mtp_hole_compaction:
             raise ValueError("QSA source patches apply only to a serve launch")
         _precache_paths(
             (paths.wheelhouse,),
@@ -515,6 +535,10 @@ def main(argv: list[str] | None = None) -> int:
         qsa_source,
         enabled=flags.qsa_fp8_compute_scratch,
     )
+    qsa_mtp_hole_patch = apply_qsa_mtp_hole_compaction_patch(
+        qsa_source,
+        enabled=flags.qsa_mtp_hole_compaction,
+    )
     cuda_home, c_compiler, cxx_compiler = _prepare_cuda(paths)
     runtime_environment = _runtime_environment(
         base=runtime_environment,
@@ -557,6 +581,7 @@ def main(argv: list[str] | None = None) -> int:
         draft_index_sha256=_sha256(draft_view / "model.safetensors.index.json"),
         linear_attn_verify_backend=flags.linear_attn_verify_backend,
         qsa_patch=qsa_patch,
+        qsa_mtp_hole_patch=qsa_mtp_hole_patch,
     )
     precache_cancel = threading.Event()
     model_precache = threading.Thread(
@@ -611,6 +636,17 @@ def apply_qsa_fp8_scratch_patch(path: Path, *, enabled: bool) -> dict[str, objec
     """Apply only the source-pinned QSA SM90 FP8-gather patch when selected."""
     source = path.read_text()
     before_sha256 = _sha256(path)
+    if before_sha256 == QSA_MTP_HOLE_AFTER_SHA256:
+        if not enabled:
+            raise ValueError("QSA source is patched; the QSA compatibility selector is required")
+        return {
+            "enabled": True,
+            "status": "already_applied",
+            "path": str(path),
+            "before_sha256": QSA_FP8_PATCH_BEFORE_SHA256,
+            "after_sha256": QSA_FP8_PATCH_AFTER_SHA256,
+            "effective_source_sha256": before_sha256,
+        }
     if before_sha256 == QSA_FP8_PATCH_AFTER_SHA256:
         if not enabled:
             raise ValueError("QSA source is patched; the QSA compatibility selector is required")
@@ -658,6 +694,68 @@ def apply_qsa_fp8_scratch_patch(path: Path, *, enabled: bool) -> dict[str, objec
         "before_sha256": before_sha256,
         "after_sha256": after_sha256,
     }
+
+
+def apply_qsa_mtp_hole_compaction_patch(
+    path: Path,
+    *,
+    enabled: bool,
+) -> dict[str, object]:
+    """Apply source-pinned MTP-hole normalization to the SM90 QSA fallback."""
+    before_sha256 = _sha256(path)
+    receipt: dict[str, object] = {
+        "enabled": enabled,
+        "status": "unpatched",
+        "path": str(path),
+        "before_sha256": before_sha256,
+        "after_sha256": before_sha256,
+    }
+    if before_sha256 == QSA_MTP_HOLE_AFTER_SHA256:
+        if not enabled:
+            raise ValueError("QSA MTP source is patched; the selector is required")
+        return {
+            **receipt,
+            "status": "already_applied",
+            "before_sha256": QSA_MTP_HOLE_BEFORE_SHA256,
+            "after_sha256": QSA_MTP_HOLE_AFTER_SHA256,
+        }
+    if not enabled:
+        return receipt
+    if before_sha256 != QSA_MTP_HOLE_BEFORE_SHA256:
+        raise ValueError(
+            "QSA MTP source hash differs from pinned v1 source: "
+            f"{before_sha256}",
+        )
+    patched_source = _apply_qsa_mtp_hole_patch_text(path.read_text())
+    after_sha256 = hashlib.sha256(patched_source.encode()).hexdigest()
+    if after_sha256 != QSA_MTP_HOLE_AFTER_SHA256:
+        raise RuntimeError(
+            "QSA MTP patch output hash differs from its reviewed after seal: "
+            f"{after_sha256}",
+        )
+    temporary = path.with_name(f".{path.name}.qsa-mtp-patch.pending")
+    file_mode = stat.S_IMODE(path.stat().st_mode)
+    try:
+        temporary.write_text(patched_source)
+        temporary.chmod(file_mode)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    if _sha256(path) != after_sha256:
+        raise RuntimeError("QSA MTP source did not retain the reviewed after seal")
+    return {
+        "enabled": True,
+        "status": "applied",
+        "path": str(path),
+        "before_sha256": before_sha256,
+        "after_sha256": after_sha256,
+    }
+
+
+def _apply_qsa_mtp_hole_patch_text(source: str) -> str:
+    if source.count(_QSA_MTP_HOLE_ANCHOR) != 1:
+        raise ValueError("Expected one pinned QSA MTP fallback anchor")
+    return source.replace(_QSA_MTP_HOLE_ANCHOR, _QSA_MTP_HOLE_REPLACEMENT)
 
 
 def _apply_qsa_patch_text(source: str) -> str:
@@ -833,6 +931,7 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         default=None,
     )
     parser.add_argument("--qsa-fp8-compute-scratch", action="store_true")
+    parser.add_argument("--qsa-mtp-hole-compaction", action="store_true")
     parser.add_argument("--prepare-only", action="store_true")
 
 
@@ -1136,6 +1235,7 @@ def _write_launch_metadata(
     draft_index_sha256: str,
     linear_attn_verify_backend: Literal["triton"] | None,
     qsa_patch: dict[str, object],
+    qsa_mtp_hole_patch: dict[str, object],
 ) -> None:
     controlled_names = (
         "PYTHONNOUSERSITE",
@@ -1200,6 +1300,10 @@ def _write_launch_metadata(
         differences.append(
             "Explicit source-pinned QSA FP8-to-query-dtype selected-K/V scratch patch applied.",
         )
+    if qsa_mtp_hole_patch["enabled"]:
+        differences.append(
+            "Explicit source-pinned QSA MTP shared-index hole compaction applied.",
+        )
     metadata = {
         "schema": "franzen-h200-launch.v1",
         "created_utc": _utc_now(),
@@ -1211,6 +1315,7 @@ def _write_launch_metadata(
         "differences_from_notebook": differences,
         "linear_attn_verify_backend_override": linear_attn_verify_backend,
         "qsa_fp8_compute_scratch_patch": qsa_patch,
+        "qsa_mtp_hole_compaction_patch": qsa_mtp_hole_patch,
         "clocks": {
             "notebook_start_epoch": started,
             "launcher_setup_started_epoch": setup_started,

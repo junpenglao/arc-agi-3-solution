@@ -172,6 +172,63 @@ def test_qsa_scratch_patch_refuses_an_unknown_source_hash(tmp_path: Path) -> Non
         franzen_h200.apply_qsa_fp8_scratch_patch(path, enabled=True)
 
 
+def test_qsa_mtp_hole_patch_is_pinned_to_real_v1_source_and_idempotent(
+    tmp_path: Path,
+) -> None:
+    from serving.franzen_h200 import (
+        QSA_MTP_HOLE_AFTER_SHA256,
+        QSA_MTP_HOLE_BEFORE_SHA256,
+        apply_qsa_fp8_scratch_patch,
+        apply_qsa_mtp_hole_compaction_patch,
+    )
+
+    fixture = Path(__file__).parent / "fixtures/qwen_sparse_attn_backend-v1.py.txt"
+    source = fixture.read_text()
+    assert _digest(fixture) == QSA_MTP_HOLE_BEFORE_SHA256
+    assert QSA_MTP_HOLE_BEFORE_SHA256 == "e5e08c37c603b2977d4b93ce1395185bc595be029ed5cb84ee976f3acb221d2c"
+    path = tmp_path / "qwen_sparse_attn_backend.py"
+    path.write_text(source)
+
+    untouched = apply_qsa_mtp_hole_compaction_patch(path, enabled=False)
+    assert untouched["status"] == "unpatched"
+    assert path.read_text() == source
+
+    applied = apply_qsa_mtp_hole_compaction_patch(path, enabled=True)
+    assert applied["status"] == "applied"
+    assert _digest(path) == QSA_MTP_HOLE_AFTER_SHA256
+    patched = path.read_text()
+    sort_position = patched.index(
+        "sort_keys = columns + invalid.to(columns.dtype) * topk",
+    )
+    assert patched.index("trtllm_decode = _resolve_trtllm_sparse_decode()") < sort_position
+    assert sort_position < patched.index(
+        "qwen_sparse_fa2_cu_seqlens_triton(",
+        sort_position,
+    )
+    repeated = apply_qsa_mtp_hole_compaction_patch(path, enabled=True)
+    assert repeated["status"] == "already_applied"
+    v1_receipt = apply_qsa_fp8_scratch_patch(path, enabled=True)
+    assert v1_receipt["status"] == "already_applied"
+    assert v1_receipt["effective_source_sha256"] == QSA_MTP_HOLE_AFTER_SHA256
+    with pytest.raises(ValueError, match="selector is required"):
+        apply_qsa_mtp_hole_compaction_patch(path, enabled=False)
+
+
+def test_qsa_mtp_hole_selector_requires_v1_scratch_selector() -> None:
+    from serving.franzen_h200 import main
+
+    with pytest.raises(ValueError, match="requires --qsa-fp8-compute-scratch"):
+        main(
+            [
+                "--wheelhouse",
+                "/missing/wheelhouse",
+                "--work-dir",
+                "/tmp/unused-qsa-test",
+                "--qsa-mtp-hole-compaction",
+            ],
+        )
+
+
 def _text_digest(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
@@ -391,6 +448,13 @@ def test_launch_receipt_records_controls_hardware_and_separate_clocks(
             "before_sha256": "b" * 64,
             "after_sha256": "a" * 64,
         },
+        qsa_mtp_hole_patch={
+            "enabled": True,
+            "status": "applied",
+            "path": "/pinned/qwen_sparse_attn_backend.py",
+            "before_sha256": "a" * 64,
+            "after_sha256": "c" * 64,
+        },
     )
 
     receipt = json.loads(paths.metadata.read_text())
@@ -408,6 +472,7 @@ def test_launch_receipt_records_controls_hardware_and_separate_clocks(
         "QSA FP8-to-query-dtype" in difference
         for difference in receipt["differences_from_notebook"]
     )
+    assert receipt["qsa_mtp_hole_compaction_patch"]["after_sha256"] == "c" * 64
     assert receipt["command"].endswith("10.15.0.15")
 
 
