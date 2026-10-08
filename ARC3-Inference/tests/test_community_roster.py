@@ -61,6 +61,7 @@ def _roster_args(**updates: object) -> Namespace:
     values: dict[str, object] = {
         "roster_group": "community268",
         "roster_manifest": "/pinned/manifest.json",
+        "roster_game_ids": None,
         "roster_asset_transport": "local",
         "environments_dir": "/pinned/environments",
         "game": "",
@@ -81,6 +82,37 @@ def _roster_args(**updates: object) -> Namespace:
         "deployment_target": "inline",
     }
     values.update(updates)
+    return Namespace(**values)
+
+
+def _run_config_args(args: Namespace, *, environments_dir: str) -> Namespace:
+    values = vars(args).copy()
+    values.update(
+        agent="coverage-test",
+        model="test-model",
+        dataset="",
+        include_tags="",
+        exclude_tags="",
+        environments_dir=environments_dir,
+        experiments_dir="",
+        experiment_dir="",
+        analyzer_save_request_logs=True,
+        pass_offset=0,
+        concurrent_jobs=1,
+        deployment_target="inline",
+        deployment_wait=False,
+        deployment_source_repos="",
+        slurm_start_local_server=False,
+        slurm_gpu="B200",
+        slurm_gpu_count=1,
+        slurm_time="01:00:00",
+        slurm_image="",
+        slurm_partition="",
+        slurm_nodelist="",
+        slurm_extra_sbatch_flags="",
+        max_actions=None,
+        max_generated_tokens_per_game=None,
+    )
     return Namespace(**values)
 
 
@@ -107,8 +139,11 @@ def test_community_roster_preserves_all_manifest_ids_and_game_api_order(
     monkeypatch.setattr(run_module, "load_game_roster", load_roster)
     args = _roster_args(roster_manifest=str(manifest), environments_dir=str(environments_dir))
     assert _resolve_game_ids(args) == expected_ids
-    assert args.roster_manifest_sha256 == hashlib.sha256(manifest.read_bytes()).hexdigest()
+    assert args.roster_manifest_sha256 == COMMUNITY_MANIFEST_SHA256
     assert args.roster_baseline_kind == "synthetic_certificate_derived_not_human"
+    assert args.roster_full_game_count == COMMUNITY_GAME_COUNT
+    assert args.roster_selected_game_ids == expected_ids
+    assert args.roster_selection_kind is None
     load_roster.assert_called_once_with(
         "community268", manifest_path=manifest, environments_dir=environments_dir
     )
@@ -141,6 +176,161 @@ def test_roster_enforcement_keeps_uncapped_traced_solver(
     assert solver.max_generated_tokens_per_game is None
     assert solver.save_request_logs is True
     assert args.roster_manifest_sha256 is None
+
+
+def test_community_roster_selects_json_ids_in_manifest_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest, environments_dir, expected_ids = _write_community_fixture(tmp_path)
+    monkeypatch.setattr(run_module, "load_game_roster", Mock(return_value=expected_ids))
+    args = _roster_args(
+        roster_manifest=str(manifest),
+        environments_dir=str(environments_dir),
+        roster_game_ids=json.dumps([expected_ids[3], expected_ids[0]]),
+    )
+
+    selected_ids = _resolve_game_ids(args)
+
+    assert selected_ids == [expected_ids[0], expected_ids[3]]
+    assert args.roster_full_game_count == COMMUNITY_GAME_COUNT
+    assert args.roster_selected_game_ids == selected_ids
+    assert args.roster_selection_kind == "coverage_supplement"
+
+    config_args = _run_config_args(args, environments_dir=str(environments_dir))
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    run_module._write_run_config(
+        config_args,
+        run_dir=run_dir,
+        game_ids=selected_ids,
+        max_experiment_runtime_minutes=30.0,
+        max_runtime_minutes_per_game=20.0,
+        max_runtime_minutes_per_game_source="explicit",
+        wave_count=1,
+    )
+    config = json.loads((run_dir / run_module.RUN_CONFIG_FILENAME).read_text())
+
+    assert config["roster_manifest_sha256"] == COMMUNITY_MANIFEST_SHA256
+    assert config["roster_full_game_count"] == COMMUNITY_GAME_COUNT
+    assert config["roster_selected_game_ids"] == selected_ids
+    assert config["roster_selected_game_count"] == len(selected_ids)
+    assert config["roster_selection_kind"] == "coverage_supplement"
+    assert config["game_count"] == len(selected_ids)
+    assert config["score_baseline_kind"] == "synthetic_certificate_derived_not_human"
+
+    csv_args = _roster_args(
+        roster_manifest=str(manifest),
+        environments_dir=str(environments_dir),
+        roster_game_ids=f"{expected_ids[3]},{expected_ids[0]}",
+    )
+    assert _resolve_game_ids(csv_args) == selected_ids
+
+
+@pytest.mark.parametrize(
+    "selection,match",
+    [
+        ("", "must not be empty"),
+        ("[]", "must not be empty"),
+        ("zz00,zz00", "duplicate"),
+        ("unknown-game", "Unknown community game id"),
+    ],
+)
+def test_community_roster_rejects_invalid_game_id_selections(
+    selection: str,
+    match: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected_ids = ["zz00", "zy00"]
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(run_module, "load_game_roster", Mock(return_value=expected_ids))
+    args = _roster_args(roster_manifest=str(manifest), roster_game_ids=selection)
+
+    with pytest.raises(ValueError, match=match):
+        _resolve_game_ids(args)
+
+
+def test_coverage_supplement_listing_keeps_roster_validation_exemptions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    expected_ids = ["zz00", "zy00", "zx00"]
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(run_module, "load_game_roster", Mock(return_value=expected_ids))
+    args = _roster_args(
+        roster_manifest=str(manifest),
+        roster_game_ids='["zx00", "zz00"]',
+        list_games=True,
+        n_passes=4,
+        analyzer_save_request_logs=False,
+        max_actions=12,
+        max_generated_tokens_per_game=1200,
+    )
+
+    assert _resolve_game_ids(args) == ["zz00", "zx00"]
+
+
+@pytest.mark.parametrize(
+    "updates,match",
+    [
+        ({"roster_group": "public25"}, "only valid with --roster-group community268"),
+        ({"max_actions": 1}, "uncapped"),
+        ({"max_generated_tokens_per_game": 1}, "uncapped"),
+        ({"n_passes": 2}, "exactly one pass"),
+    ],
+)
+def test_coverage_supplement_requires_community_uncapped_single_pass(
+    updates: dict[str, object],
+    match: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(run_module, "load_game_roster", Mock(return_value=["zz00"]))
+    args = _roster_args(
+        roster_manifest="" if updates.get("roster_group") == "public25" else str(manifest),
+        roster_game_ids='["zz00"]',
+        **updates,
+    )
+
+    with pytest.raises(ValueError, match=match):
+        _resolve_game_ids(args)
+
+
+def test_coverage_supplement_still_verifies_every_community_asset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest, environments_dir, expected_ids = _write_community_fixture(tmp_path)
+    unselected_game_path = (
+        environments_dir / "ext_arcinteractive" / expected_ids[1] / "game.py"
+    )
+    unselected_game_path.write_text("# changed outside the selected subset\n", encoding="utf-8")
+    expected_manifest_sha256 = hashlib.sha256(manifest.read_bytes()).hexdigest()
+
+    def load_fixture_roster(
+        group: str,
+        *,
+        manifest_path: Path | None,
+        environments_dir: Path | None,
+    ) -> list[str]:
+        return load_game_roster(
+            group,
+            manifest_path=manifest_path,
+            environments_dir=environments_dir,
+            expected_manifest_sha256=expected_manifest_sha256,
+        )
+
+    monkeypatch.setattr(run_module, "load_game_roster", load_fixture_roster)
+    args = _roster_args(
+        roster_manifest=str(manifest),
+        environments_dir=str(environments_dir),
+        roster_game_ids=expected_ids[0],
+    )
+
+    with pytest.raises(ValueError, match="game.py hash mismatch"):
+        _resolve_game_ids(args)
 
 
 def test_community_roster_rejects_asset_hash_drift(tmp_path: Path) -> None:
@@ -269,11 +459,19 @@ def test_cli_registers_roster_and_mount_controls() -> None:
     run_module._add_roster_arguments(parser)
 
     args = parser.parse_args(
-        ["--roster-group", "community268", "--roster-asset-transport", "mounted"]
+        [
+            "--roster-group",
+            "community268",
+            "--roster-asset-transport",
+            "mounted",
+            "--roster-game-ids",
+            '["zz00"]',
+        ]
     )
 
     assert args.roster_group == "community268"
     assert args.roster_asset_transport == "mounted"
+    assert args.roster_game_ids == '["zz00"]'
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf"), 0.0, -1.0])

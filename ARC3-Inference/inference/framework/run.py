@@ -29,6 +29,7 @@ from dotenv import load_dotenv
 
 from inference.framework.kaggle import DUCK_HARNESS_PUBLIC_GAME_IDS
 from inference.framework.roster import (
+    COMMUNITY_MANIFEST_SHA256,
     COMMUNITY_SCORE_BASELINE_KIND,
     load_game_roster,
 )
@@ -52,7 +53,9 @@ def _configure_logging() -> None:
     )
 
 
-def _parse_optional_list(raw_value: Any, *, option_name: str) -> list[str]:
+def _parse_optional_list(
+    raw_value: Any, *, option_name: str, preserve_duplicates: bool = False
+) -> list[str]:
     if isinstance(raw_value, list):
         values = raw_value
     else:
@@ -73,7 +76,7 @@ def _parse_optional_list(raw_value: Any, *, option_name: str) -> list[str]:
     normalized: list[str] = []
     for value in values:
         item = str(value).strip()
-        if item and item not in normalized:
+        if item and (preserve_duplicates or item not in normalized):
             normalized.append(item)
     return normalized
 
@@ -115,6 +118,25 @@ def _apply_share_version_overrides(args: argparse.Namespace) -> None:
 def _resolve_game_ids(args: argparse.Namespace) -> list[str]:
     roster_group = str(getattr(args, "roster_group", "") or "").strip()
     roster_manifest = str(getattr(args, "roster_manifest", "") or "").strip()
+    raw_roster_game_ids = getattr(args, "roster_game_ids", None)
+    requested_roster_game_ids = (
+        None
+        if raw_roster_game_ids is None
+        else _parse_optional_list(
+            raw_roster_game_ids,
+            option_name="--roster-game-ids",
+            preserve_duplicates=True,
+        )
+    )
+    if requested_roster_game_ids is not None:
+        if roster_group != "community268":
+            raise ValueError(
+                "--roster-game-ids is only valid with --roster-group community268."
+            )
+        if not requested_roster_game_ids:
+            raise ValueError("--roster-game-ids must not be empty.")
+        if len(set(requested_roster_game_ids)) != len(requested_roster_game_ids):
+            raise ValueError("--roster-game-ids must not contain duplicate ids.")
     if roster_group or roster_manifest:
         if not roster_group:
             raise ValueError("--roster-manifest requires --roster-group.")
@@ -177,9 +199,28 @@ def _resolve_game_ids(args: argparse.Namespace) -> list[str]:
             manifest_path=Path(roster_manifest) if roster_manifest else None,
             environments_dir=Path(args.environments_dir),
         )
+        full_game_count = len(game_ids)
+        if requested_roster_game_ids is not None:
+            unknown_game_ids = [
+                game_id
+                for game_id in requested_roster_game_ids
+                if game_id not in game_ids
+            ]
+            if unknown_game_ids:
+                raise ValueError(
+                    "Unknown community game id selection: "
+                    f"{', '.join(unknown_game_ids)}."
+                )
+            selected_game_ids = set(requested_roster_game_ids)
+            game_ids = [game_id for game_id in game_ids if game_id in selected_game_ids]
         args.roster_manifest_sha256 = (
-            hashlib.sha256(Path(roster_manifest).read_bytes()).hexdigest()
-            if roster_manifest
+            COMMUNITY_MANIFEST_SHA256 if roster_group == "community268" else None
+        )
+        args.roster_full_game_count = full_game_count
+        args.roster_selected_game_ids = list(game_ids)
+        args.roster_selection_kind = (
+            "coverage_supplement"
+            if requested_roster_game_ids is not None
             else None
         )
         args.roster_baseline_kind = (
@@ -867,6 +908,14 @@ def _write_run_config(
         "roster_group": str(getattr(args, "roster_group", "") or "") or None,
         "roster_manifest": str(getattr(args, "roster_manifest", "") or "") or None,
         "roster_manifest_sha256": getattr(args, "roster_manifest_sha256", None),
+        "roster_full_game_count": getattr(args, "roster_full_game_count", None),
+        "roster_selected_game_ids": getattr(args, "roster_selected_game_ids", None),
+        "roster_selected_game_count": (
+            len(game_ids)
+            if getattr(args, "roster_selected_game_ids", None) is not None
+            else None
+        ),
+        "roster_selection_kind": getattr(args, "roster_selection_kind", None),
         "roster_asset_transport": getattr(args, "roster_asset_transport", "local"),
         "score_baseline_kind": getattr(args, "roster_baseline_kind", None),
         "save_request_logs": bool(args.analyzer_save_request_logs),
@@ -1485,6 +1534,15 @@ def _add_roster_arguments(parser: argparse.ArgumentParser) -> None:
         "--roster-manifest",
         default="",
         help="SHA256-pinned TRAIN268 manifest; required for community268.",
+    )
+    parser.add_argument(
+        "--roster-game-ids",
+        default=None,
+        help=(
+            "Community game ids for a coverage supplement; accepts a comma-separated "
+            "list or JSON list in manifest order. The full roster and assets are "
+            "always verified first."
+        ),
     )
     parser.add_argument(
         "--roster-asset-transport",
