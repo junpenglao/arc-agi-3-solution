@@ -6,6 +6,7 @@ from pathlib import Path
 
 import hashlib
 import json
+import signal
 import stat
 import subprocess
 import threading
@@ -419,6 +420,7 @@ def test_startup_timeout_terminates_and_reaps_owned_process_group(
     paths = _runtime_paths(tmp_path)
     process = _FakeProcess((None, None, None))
     signals: list[int] = []
+    group_alive = [True]
     clock = iter((10.0, 10.0, 12.0, 12.0, 12.0, 12.0))
     monkeypatch.setattr(franzen_h200.subprocess, "Popen", lambda *args, **kwargs: process)
     monkeypatch.setattr(franzen_h200, "_query_gpu", lambda: [])
@@ -429,10 +431,17 @@ def test_startup_timeout_terminates_and_reaps_owned_process_group(
     )
     monkeypatch.setattr(franzen_h200.time, "monotonic", lambda: next(clock, 12.0))
     monkeypatch.setattr(franzen_h200.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(franzen_h200, "_process_group_exists", lambda _process: group_alive[0])
+
+    def signal_group(_process, sig: signal.Signals) -> None:
+        signals.append(process.pid)
+        group_alive[0] = False
+        process.returncode = -int(sig)
+
     monkeypatch.setattr(
         franzen_h200,
         "_signal_process_group",
-        lambda _process, _signal: signals.append(_process.pid) or setattr(_process, "returncode", -15),
+        signal_group,
     )
 
     result = _launch_and_wait(
@@ -450,6 +459,152 @@ def test_startup_timeout_terminates_and_reaps_owned_process_group(
     assert signals == [process.pid]
     assert process.waited
     assert json.loads((paths.work_dir / "launch-result.json").read_text())["server_left_running"] is False
+
+
+def test_exited_leader_still_reaps_live_owned_process_group(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from serving import franzen_h200
+
+    paths = _runtime_paths(tmp_path)
+    process = _FakeProcess((0,))
+    group_alive = True
+    signals: list[signal.Signals] = []
+
+    def signal_group(_process, sig: signal.Signals) -> None:
+        nonlocal group_alive
+        signals.append(sig)
+        group_alive = False
+
+    monkeypatch.setattr(franzen_h200.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(franzen_h200, "_query_gpu", lambda: [])
+    monkeypatch.setattr(franzen_h200, "_process_group_exists", lambda _process: group_alive, raising=False)
+    monkeypatch.setattr(franzen_h200, "_signal_process_group", signal_group)
+
+    result = _launch_and_wait(
+        paths=paths,
+        argv=("sglang", "serve", "--port", "8001"),
+        environment={},
+        notebook_start_epoch=1.0,
+        startup_timeout=30,
+        precache_cancel=threading.Event(),
+        cancellation=threading.Event(),
+        bind_host="127.0.0.1",
+    )
+
+    assert result == 2
+    assert signals == [signal.SIGTERM]
+    assert json.loads((paths.work_dir / "launch-result.json").read_text())["server_left_running"] is False
+
+
+def test_process_group_escalates_when_descendant_ignores_term(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from serving import franzen_h200
+
+    process = _FakeProcess((0,))
+    group_alive = True
+    signals: list[signal.Signals] = []
+
+    def signal_group(_process, sig: signal.Signals) -> None:
+        nonlocal group_alive
+        signals.append(sig)
+        if sig == signal.SIGKILL:
+            group_alive = False
+
+    monkeypatch.setattr(franzen_h200, "GROUP_TERMINATION_GRACE_SECONDS", 0, raising=False)
+    monkeypatch.setattr(franzen_h200, "_process_group_exists", lambda _process: group_alive, raising=False)
+    monkeypatch.setattr(franzen_h200, "_signal_process_group", signal_group)
+    monkeypatch.setattr(franzen_h200.time, "sleep", lambda _seconds: None)
+
+    franzen_h200._terminate_process_group(process)
+
+    assert signals == [signal.SIGTERM, signal.SIGKILL]
+
+
+def test_launch_receipt_reports_a_process_group_survivor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from serving import franzen_h200
+
+    paths = _runtime_paths(tmp_path)
+    process = _FakeProcess((0,))
+    signals: list[signal.Signals] = []
+    monkeypatch.setattr(franzen_h200.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(franzen_h200, "_query_gpu", lambda: [])
+    monkeypatch.setattr(franzen_h200, "_process_group_exists", lambda _process: True)
+    monkeypatch.setattr(
+        franzen_h200,
+        "_signal_process_group",
+        lambda _process, sig: signals.append(sig),
+    )
+    monkeypatch.setattr(franzen_h200, "GROUP_TERMINATION_GRACE_SECONDS", 0)
+    monkeypatch.setattr(franzen_h200, "GROUP_KILL_WAIT_SECONDS", 0)
+
+    result = _launch_and_wait(
+        paths=paths,
+        argv=("sglang", "serve", "--port", "8001"),
+        environment={},
+        notebook_start_epoch=1.0,
+        startup_timeout=30,
+        precache_cancel=threading.Event(),
+        cancellation=threading.Event(),
+        bind_host="127.0.0.1",
+    )
+
+    launch_receipt = json.loads((paths.work_dir / "launch-result.json").read_text())
+    pid_receipt = json.loads(paths.pid_file.read_text())
+    assert result == 2
+    assert signals == [signal.SIGTERM, signal.SIGKILL]
+    assert launch_receipt["server_left_running"] is True
+    assert pid_receipt["status"] == "group_survivors"
+
+
+def test_post_spawn_receipt_failure_still_cleans_owned_group(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from serving import franzen_h200
+
+    paths = _runtime_paths(tmp_path)
+    process = _FakeProcess((None,))
+    group_alive = True
+    signals: list[signal.Signals] = []
+    original_write_json = franzen_h200._write_json
+    fail_pid_receipt = True
+
+    def write_json(path: Path, payload: object) -> None:
+        nonlocal fail_pid_receipt
+        if path == paths.pid_file and fail_pid_receipt:
+            fail_pid_receipt = False
+            raise OSError("synthetic PID receipt failure")
+        original_write_json(path, payload)
+
+    def signal_group(_process, sig: signal.Signals) -> None:
+        nonlocal group_alive
+        signals.append(sig)
+        group_alive = False
+
+    monkeypatch.setattr(franzen_h200.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(franzen_h200, "_process_group_exists", lambda _process: group_alive, raising=False)
+    monkeypatch.setattr(franzen_h200, "_signal_process_group", signal_group)
+    monkeypatch.setattr(franzen_h200, "_write_json", write_json)
+
+    with pytest.raises(OSError, match="synthetic PID receipt failure"):
+        _launch_and_wait(
+            paths=paths,
+            argv=("sglang", "serve", "--port", "8001"),
+            environment={},
+            notebook_start_epoch=1.0,
+            startup_timeout=30,
+            precache_cancel=threading.Event(),
+            cancellation=threading.Event(),
+            bind_host="127.0.0.1",
+        )
+
+    assert signals == [signal.SIGTERM]
 
 
 def test_readiness_does_not_stop_supervision_or_gpu_metrics(
@@ -519,12 +674,20 @@ def test_cancellation_reaps_the_owned_process_and_cancels_precache(
     cancellation.set()
     precache_cancel = threading.Event()
     signals: list[int] = []
+    group_alive = [True]
     monkeypatch.setattr(franzen_h200.subprocess, "Popen", lambda *args, **kwargs: process)
     monkeypatch.setattr(franzen_h200, "_query_gpu", lambda: [])
+    monkeypatch.setattr(franzen_h200, "_process_group_exists", lambda _process: group_alive[0])
+
+    def signal_group(_process, sig: signal.Signals) -> None:
+        signals.append(process.pid)
+        group_alive[0] = False
+        process.returncode = -int(sig)
+
     monkeypatch.setattr(
         franzen_h200,
         "_signal_process_group",
-        lambda _process, _signal: signals.append(process.pid) or setattr(process, "returncode", -15),
+        signal_group,
     )
 
     result = _launch_and_wait(

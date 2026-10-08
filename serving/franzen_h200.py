@@ -45,6 +45,9 @@ GPU_QUERY = (
 )
 PRECACHE_BLOCK_BYTES = 32 * 1024 * 1024
 GPU_STATIC_MEMORY_FRACTION = 0.96
+GROUP_TERMINATION_GRACE_SECONDS = 10
+GROUP_KILL_WAIT_SECONDS = 10
+GROUP_POLL_INTERVAL_SECONDS = 0.1
 QSA_FP8_PATCH_BEFORE_SHA256 = "2ce24d66d6a0bff0e22ff0819291649a4169937f32c5c28241215c6eb119ad54"
 QSA_FP8_PATCH_AFTER_SHA256 = "e5e08c37c603b2977d4b93ce1395185bc595be029ed5cb84ee976f3acb221d2c"
 _QSA_FORWARD_EXTEND_ANCHOR = "    def forward_extend(\n"
@@ -1268,30 +1271,37 @@ def _launch_and_wait(
 ) -> int:
     log_offset = paths.log.stat().st_size if paths.log.exists() else 0
     server_url = _health_url(bind_host, int(argv[argv.index("--port") + 1]))
-    with paths.log.open("ab", buffering=0) as log_file:
-        process = subprocess.Popen(
-            argv,
-            env=environment,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-    process_start_epoch = time.time()
-    process_start_monotonic = time.monotonic()
-    startup_deadline = process_start_monotonic + startup_timeout
-    _write_json(paths.pid_file, {"pid": process.pid, "argv": list(argv)})
     stop_metrics = threading.Event()
-    metrics_thread = threading.Thread(
-        target=_record_gpu_metrics,
-        args=(paths.metrics, stop_metrics),
-        name="franzen-h200-gpu-metrics",
-        daemon=True,
-    )
-    metrics_thread.start()
-    last_report = 0.0
-    ready = False
-    status = "running"
+    metrics_thread: threading.Thread | None = None
+    metrics_started = False
+    group_survivors = False
+    return_code: int | None = None
+    process: subprocess.Popen[str] | None = None
     try:
+        with paths.log.open("ab", buffering=0) as log_file:
+            process = subprocess.Popen(
+                argv,
+                env=environment,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        assert process is not None
+        process_start_epoch = time.time()
+        process_start_monotonic = time.monotonic()
+        startup_deadline = process_start_monotonic + startup_timeout
+        _write_json(paths.pid_file, {"pid": process.pid, "argv": list(argv)})
+        metrics_thread = threading.Thread(
+            target=_record_gpu_metrics,
+            args=(paths.metrics, stop_metrics),
+            name="franzen-h200-gpu-metrics",
+            daemon=True,
+        )
+        metrics_thread.start()
+        metrics_started = True
+        last_report = 0.0
+        ready = False
+        status = "running"
         while process.poll() is None:
             if cancellation.is_set():
                 status = "cancelled"
@@ -1341,19 +1351,26 @@ def _launch_and_wait(
         raise
     finally:
         precache_cancel.set()
-        if process.poll() is None:
-            _terminate_process_group(process)
-        try:
-            return_code = process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            _signal_process_group(process, signal.SIGKILL)
-            return_code = process.wait()
         stop_metrics.set()
-        metrics_thread.join(timeout=5)
-        _write_json(
-            paths.pid_file,
-            {"pid": process.pid, "status": "reaped", "returncode": return_code},
-        )
+        if metrics_started and metrics_thread is not None:
+            metrics_thread.join(timeout=5)
+        if process is not None:
+            group_survivors = _terminate_process_group(process)
+            try:
+                return_code = process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                _signal_process_group(process, signal.SIGKILL)
+                return_code = process.wait()
+            _write_json(
+                paths.pid_file,
+                {
+                    "pid": process.pid,
+                    "status": "group_survivors" if group_survivors else "reaped",
+                    "returncode": return_code,
+                    "group_survivors": group_survivors,
+                },
+            )
+    assert process is not None
     result = {
         "status": status,
         "utc": _utc_now(),
@@ -1365,15 +1382,16 @@ def _launch_and_wait(
         "startup_deadline_monotonic": startup_deadline,
         "startup_timeout_seconds": startup_timeout,
         "startup_elapsed_seconds": time.monotonic() - process_start_monotonic,
-        "server_left_running": False,
+        "server_left_running": group_survivors,
         "returncode": return_code,
     }
     _write_json(paths.work_dir / "launch-result.json", result)
     _show_log_tail(paths.log, offset=log_offset)
-    if status == "exited" and return_code == 0:
+    if status == "exited" and return_code == 0 and not group_survivors:
         return 0
     print(
-        f"Server lifecycle ended ({status}, returncode={return_code}); owned process group was reaped. "
+        f"Server lifecycle ended ({status}, returncode={return_code}, "
+        f"group_survivors={group_survivors}). "
         f"Inspect {paths.log} and {paths.metadata}.",
         file=sys.stderr,
     )
@@ -1384,13 +1402,42 @@ def _launch_and_wait(
     return return_code if return_code != 0 else 2
 
 
-def _terminate_process_group(process: subprocess.Popen[str]) -> None:
+def _terminate_process_group(process: subprocess.Popen[str]) -> bool:
+    """Terminate the owned session and report whether any member survived."""
+    if not _process_group_exists(process):
+        return False
     _signal_process_group(process, signal.SIGTERM)
-    try:
-        process.wait(timeout=10)
-    except subprocess.TimeoutExpired:
+    if _wait_for_process_group_exit(process, GROUP_TERMINATION_GRACE_SECONDS):
         _signal_process_group(process, signal.SIGKILL)
-        process.wait()
+        return _wait_for_process_group_exit(process, GROUP_KILL_WAIT_SECONDS)
+    return False
+
+
+def _wait_for_process_group_exit(
+    process: subprocess.Popen[str],
+    timeout: float,
+) -> bool:
+    deadline = time.monotonic() + timeout
+    while _process_group_exists(process):
+        if time.monotonic() >= deadline:
+            return True
+        if process.poll() is None:
+            try:
+                process.wait(timeout=min(GROUP_POLL_INTERVAL_SECONDS, max(0.0, deadline - time.monotonic())))
+            except subprocess.TimeoutExpired:
+                pass
+        time.sleep(GROUP_POLL_INTERVAL_SECONDS)
+    return False
+
+
+def _process_group_exists(process: subprocess.Popen[str]) -> bool:
+    try:
+        os.killpg(process.pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def _signal_process_group(process: subprocess.Popen[str], sig: signal.Signals) -> None:
