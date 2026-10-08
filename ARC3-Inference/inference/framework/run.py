@@ -13,12 +13,9 @@ import logging
 import math
 import os
 import sys
-import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-
-from dotenv import load_dotenv
 
 import taaf.benchmark
 import taaf.deploy
@@ -27,8 +24,14 @@ import taaf.deploy_kaggle
 import taaf.deploy_slurm
 import taaf.game
 import taaf.game_api
+import tomllib
+from dotenv import load_dotenv
 
 from inference.framework.kaggle import DUCK_HARNESS_PUBLIC_GAME_IDS
+from inference.framework.roster import (
+    COMMUNITY_SCORE_BASELINE_KIND,
+    load_game_roster,
+)
 from inference.framework.solver import HarnessSolver
 from inference.utils.run_artifacts import save_git_info, setup_experiment_directory
 
@@ -110,6 +113,79 @@ def _apply_share_version_overrides(args: argparse.Namespace) -> None:
 
 
 def _resolve_game_ids(args: argparse.Namespace) -> list[str]:
+    roster_group = str(getattr(args, "roster_group", "") or "").strip()
+    roster_manifest = str(getattr(args, "roster_manifest", "") or "").strip()
+    if roster_group or roster_manifest:
+        if not roster_group:
+            raise ValueError("--roster-manifest requires --roster-group.")
+        if not str(args.environments_dir or "").strip():
+            raise ValueError("--environments-dir is required with --roster-group.")
+        deployment_target = str(args.deployment_target).strip().lower()
+        if bool(getattr(args, "simulate_competition_arcade", False)):
+            raise ValueError("Roster reproduction cannot use the competition simulator.")
+        if bool(getattr(args, "kaggle_make_share_version", False)):
+            raise ValueError("Roster reproduction cannot use Kaggle share mode.")
+        if bool(getattr(args, "kaggle_duck_public_harness", False)):
+            raise ValueError("Roster reproduction cannot use the Kaggle Duck override.")
+        if deployment_target == "kaggle":
+            raise ValueError("Roster reproduction has no Kaggle asset transport.")
+        if deployment_target not in {"inline", "slurm"}:
+            raise ValueError(f"Unsupported roster deployment target: {deployment_target}.")
+        asset_transport = str(getattr(args, "roster_asset_transport", "local"))
+        if deployment_target == "slurm" and asset_transport != "mounted":
+            raise ValueError(
+                "Slurm roster runs require --roster-asset-transport mounted."
+            )
+        if asset_transport not in {"local", "mounted"}:
+            raise ValueError(f"Unsupported roster asset transport: {asset_transport}.")
+        if asset_transport == "mounted" and not Path(args.environments_dir).is_absolute():
+            raise ValueError("Mounted roster asset paths must be absolute.")
+        if not bool(getattr(args, "list_games", False)):
+            if args.max_actions is not None or args.max_generated_tokens_per_game is not None:
+                raise ValueError("Roster reproduction must remain uncapped.")
+        if not bool(getattr(args, "list_games", False)):
+            if int(args.n_passes) != 1:
+                raise ValueError("Roster reproduction runs require exactly one pass.")
+            if not bool(args.analyzer_save_request_logs):
+                raise ValueError("Roster reproduction runs require --save-request-logs.")
+            _optional_positive_float(
+                args.max_runtime_minutes, option_name="--max-runtime-minutes"
+            )
+            _optional_positive_float(
+                args.max_experiment_runtime_minutes,
+                option_name="--max-experiment-runtime-minutes",
+            )
+            _optional_positive_float(
+                args.max_experiment_runtime_hours,
+                option_name="--max-experiment-runtime-hours",
+            )
+        if any(
+            _parse_optional_list(value, option_name=option_name)
+            for value, option_name in (
+                (args.game, "--game"),
+                (args.dataset, "--dataset"),
+                (args.include_tags, "--include-tags"),
+                (args.exclude_tags, "--exclude-tags"),
+            )
+        ):
+            raise ValueError(
+                "--roster-group cannot be combined with --game, --dataset, "
+                "--include-tags, or --exclude-tags."
+            )
+        game_ids = load_game_roster(
+            roster_group,
+            manifest_path=Path(roster_manifest) if roster_manifest else None,
+            environments_dir=Path(args.environments_dir),
+        )
+        args.roster_manifest_sha256 = (
+            hashlib.sha256(Path(roster_manifest).read_bytes()).hexdigest()
+            if roster_manifest
+            else None
+        )
+        args.roster_baseline_kind = (
+            COMMUNITY_SCORE_BASELINE_KIND if roster_group == "community268" else None
+        )
+        return game_ids
     requested_games = _parse_optional_list(args.game, option_name="--game")
     dataset_specs = _parse_optional_list(args.dataset, option_name="--dataset")
     include_tags = _parse_optional_list(args.include_tags, option_name="--include-tags")
@@ -361,7 +437,7 @@ def _make_deployment_target(
         target_kwargs["max_runtime_s"] = float(resolved_max_runtime_s)
     target = taaf.deploy_slurm.TufaSlurmTarget(**target_kwargs)
     if resolved_max_runtime_s is not None and not hasattr(target, "max_runtime_s"):
-        setattr(target, "max_runtime_s", float(resolved_max_runtime_s))
+        target.max_runtime_s = float(resolved_max_runtime_s)
     return target
 
 
@@ -500,8 +576,8 @@ def _optional_positive_float(raw_value: Any, *, option_name: str) -> float | Non
     if raw_value in (None, ""):
         return None
     value = float(raw_value)
-    if value <= 0:
-        raise ValueError(f"{option_name} must be positive.")
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{option_name} must be finite and positive.")
     return value
 
 
@@ -611,7 +687,7 @@ def _competition_arcade_enabled(args: argparse.Namespace) -> bool:
 
 def _competition_arcade_module() -> Any:
     try:
-        import taaf.competition_arcade as competition_arcade
+        from taaf import competition_arcade
     except ModuleNotFoundError as exc:
         raise RuntimeError(
             "--simulate-competition-arcade requires a TAAF build with taaf.competition_arcade."
@@ -788,6 +864,12 @@ def _write_run_config(
             else None
         ),
         "games": list(game_ids),
+        "roster_group": str(getattr(args, "roster_group", "") or "") or None,
+        "roster_manifest": str(getattr(args, "roster_manifest", "") or "") or None,
+        "roster_manifest_sha256": getattr(args, "roster_manifest_sha256", None),
+        "roster_asset_transport": getattr(args, "roster_asset_transport", "local"),
+        "score_baseline_kind": getattr(args, "roster_baseline_kind", None),
+        "save_request_logs": bool(args.analyzer_save_request_logs),
         "game_count": len(game_ids),
         "game_run_count": game_run_count,
         "n_passes": int(args.n_passes),
@@ -801,6 +883,10 @@ def _write_run_config(
         "analyzer_timeout_seconds": getattr(args, "analyzer_timeout", 120),
         "wave_count": wave_count,
         "max_actions": args.max_actions,
+        "max_generated_tokens_per_game": args.max_generated_tokens_per_game,
+        "max_runtime_minutes_requested": args.max_runtime_minutes,
+        "max_experiment_runtime_minutes_requested": args.max_experiment_runtime_minutes,
+        "max_experiment_runtime_hours_requested": args.max_experiment_runtime_hours,
         "max_runtime_minutes_per_game": max_runtime_minutes_per_game,
         "max_runtime_minutes_per_game_source": max_runtime_minutes_per_game_source,
         "max_experiment_runtime_minutes": max_experiment_runtime_minutes,
@@ -1206,11 +1292,18 @@ def main() -> None:
         default="",
         help="Game id/env name, comma-separated list, or JSON list.",
     )
+    _add_roster_arguments(parser)
     parser.add_argument("--dataset", "--datasets", dest="dataset", default="")
     parser.add_argument("--include-tags", dest="include_tags", default="")
     parser.add_argument("--exclude-tags", dest="exclude_tags", default="")
     parser.add_argument(
-        "--environments-dir", dest="environments_dir", default=None
+        "--environments-dir",
+        dest="environments_dir",
+        default=None,
+        help=(
+            "Offline environment asset root; required for --roster-group. "
+            "Use --roster-asset-transport mounted for a shared Slurm asset path."
+        ),
     )
     parser.add_argument("--datasets-dir", dest="datasets_dir", default=None)
     parser.add_argument(
@@ -1375,9 +1468,30 @@ def main() -> None:
     _apply_share_version_overrides(args)
     try:
         _run(args)
-    except Exception as exc:
-        log.error("%s", exc, exc_info=True)
+    except Exception:
+        log.exception("Run failed.")
         sys.exit(1)
+
+
+def _add_roster_arguments(parser: argparse.ArgumentParser) -> None:
+    """Register explicit public and pinned-community roster options."""
+    parser.add_argument(
+        "--roster-group",
+        choices=["public25", "community268"],
+        default="",
+        help="Use the fixed 25-game roster or the pinned 268-game community manifest.",
+    )
+    parser.add_argument(
+        "--roster-manifest",
+        default="",
+        help="SHA256-pinned TRAIN268 manifest; required for community268.",
+    )
+    parser.add_argument(
+        "--roster-asset-transport",
+        choices=["local", "mounted"],
+        default="local",
+        help="Use mounted for Slurm only when the explicit asset path is shared.",
+    )
 
 
 if __name__ == "__main__":
