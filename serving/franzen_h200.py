@@ -26,7 +26,7 @@ import zipfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Protocol, cast
+from typing import Literal, Protocol, cast
 
 
 NOTEBOOK_SOURCE_SHA256 = "25879d2fee20cbf91a4ccd684477ad5db69f0d2e36d81a1de1dd49bb68e4210d"
@@ -58,6 +58,7 @@ class Flags(Protocol):
     notebook_start_epoch: float | None
     prepare_only: bool
     bind_host: str
+    linear_attn_verify_backend: Literal["triton"] | None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -90,6 +91,7 @@ def build_server_argv(
     port: int,
     chat_template: Path | None,
     bind_host: str = "127.0.0.1",
+    linear_attn_verify_backend: Literal["triton"] | None = None,
 ) -> tuple[str, ...]:
     """Build the notebook-equivalent command without changing model controls."""
     graph_bs = (1, 2, 4, 7, 8, 9, 10)
@@ -198,6 +200,10 @@ def build_server_argv(
     ]
     if chat_template is not None:
         arguments.extend(("--chat-template", str(chat_template)))
+    if linear_attn_verify_backend is not None:
+        arguments.extend(
+            ("--linear-attn-verify-backend", linear_attn_verify_backend),
+        )
     return tuple(arguments)
 
 
@@ -470,6 +476,7 @@ def main(argv: list[str] | None = None) -> int:
         port=flags.port,
         chat_template=chat_template if chat_template.is_file() else None,
         bind_host=flags.bind_host,
+        linear_attn_verify_backend=flags.linear_attn_verify_backend,
     )
     _write_launch_metadata(
         paths=paths,
@@ -490,6 +497,7 @@ def main(argv: list[str] | None = None) -> int:
         target_index_sha256=_sha256(paths.target_dir / "model.safetensors.index.json"),
         draft_config_sha256=_sha256(draft_view / "config.json"),
         draft_index_sha256=_sha256(draft_view / "model.safetensors.index.json"),
+        linear_attn_verify_backend=flags.linear_attn_verify_backend,
     )
     precache_cancel = threading.Event()
     model_precache = threading.Thread(
@@ -675,6 +683,11 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--startup-timeout", type=int, default=720)
     parser.add_argument("--notebook-start-epoch", type=float)
     parser.add_argument("--bind-host", default="127.0.0.1")
+    parser.add_argument(
+        "--linear-attn-verify-backend",
+        choices=("triton",),
+        default=None,
+    )
     parser.add_argument("--prepare-only", action="store_true")
 
 
@@ -976,6 +989,7 @@ def _write_launch_metadata(
     target_index_sha256: str,
     draft_config_sha256: str,
     draft_index_sha256: str,
+    linear_attn_verify_backend: Literal["triton"] | None,
 ) -> None:
     controlled_names = (
         "PYTHONNOUSERSITE",
@@ -1025,6 +1039,17 @@ def _write_launch_metadata(
     managed_environment = {
         key: environment[key] for key in controlled_names if key in environment
     }
+    differences = [
+        "Notebook targets RTX PRO 6000 SM120; this route requires H200 SM90.",
+        "TORCH_CUDA_ARCH_LIST changes from 12.0 to 9.0.",
+        "Four SM120-only optimization flags are explicitly set to 0.",
+        "MTP NEXTN settings and FP8 KV/draft cache settings remain enabled.",
+        "Setup and notebook clocks are recorded separately; readiness timeout starts at the Popen monotonic clock.",
+    ]
+    if linear_attn_verify_backend is not None:
+        differences.append(
+            f"Explicit compatibility override: --linear-attn-verify-backend {linear_attn_verify_backend}.",
+        )
     metadata = {
         "schema": "franzen-h200-launch.v1",
         "created_utc": _utc_now(),
@@ -1033,13 +1058,8 @@ def _write_launch_metadata(
         "sglang_version": SGLANG_VERSION,
         "route": "H200-SM90",
         "expected_gpu": {"name": "NVIDIA H200", "compute_capability": "9.0"},
-        "differences_from_notebook": [
-            "Notebook targets RTX PRO 6000 SM120; this route requires H200 SM90.",
-            "TORCH_CUDA_ARCH_LIST changes from 12.0 to 9.0.",
-            "Four SM120-only optimization flags are explicitly set to 0.",
-            "MTP NEXTN settings and FP8 KV/draft cache settings remain enabled.",
-            "Setup and notebook clocks are recorded separately; readiness timeout starts at the Popen monotonic clock.",
-        ],
+        "differences_from_notebook": differences,
+        "linear_attn_verify_backend_override": linear_attn_verify_backend,
         "clocks": {
             "notebook_start_epoch": started,
             "launcher_setup_started_epoch": setup_started,

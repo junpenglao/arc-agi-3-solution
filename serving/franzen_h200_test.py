@@ -101,6 +101,33 @@ def test_server_argv_can_bind_to_the_private_host(tmp_path: Path) -> None:
     assert args[args.index("--host") + 1] == "10.15.0.15"
 
 
+def test_explicit_triton_verify_override_changes_only_one_argv_pair(
+    tmp_path: Path,
+) -> None:
+    arguments = {
+        "sglang": tmp_path / "venv/bin/sglang",
+        "model_dir": tmp_path / "target",
+        "draft_view": tmp_path / "draft-view",
+        "token_map": tmp_path / "tokens.pt",
+        "port": 8001,
+        "chat_template": None,
+    }
+    base = build_server_argv(**arguments)
+    retry = build_server_argv(**arguments, linear_attn_verify_backend="triton")
+
+    assert retry[:-2] == base
+    assert retry[-2:] == ("--linear-attn-verify-backend", "triton")
+    assert _option_value(retry, "--mamba-ssm-dtype") == "bfloat16"
+    assert _option_value(retry, "--mamba-backend") == "flashinfer"
+    assert _option_value(retry, "--linear-attn-decode-backend") == "flashinfer"
+    assert _option_value(retry, "--linear-attn-prefill-backend") == "flashinfer"
+    assert _option_value(retry, "--gdn-mtp-cache-mode") == "none"
+    assert _option_value(retry, "--kv-cache-dtype") == "fp8_e4m3"
+    assert _option_value(retry, "--speculative-num-steps") == "3"
+    assert _option_value(retry, "--speculative-num-draft-tokens") == "4"
+    assert _option_value(retry, "--speculative-draft-kv-cache-dtype") == "fp8_e4m3"
+
+
 def test_h200_environment_is_explicit_without_disabling_mtp_or_fp8() -> None:
     environment = h200_environment(
         base={"PATH": "/usr/bin", "TORCH_CUDA_ARCH_LIST": "12.0"},
@@ -308,6 +335,7 @@ def test_launch_receipt_records_controls_hardware_and_separate_clocks(
         target_index_sha256="d" * 64,
         draft_config_sha256="e" * 64,
         draft_index_sha256="f" * 64,
+        linear_attn_verify_backend="triton",
     )
 
     receipt = json.loads(paths.metadata.read_text())
@@ -316,6 +344,10 @@ def test_launch_receipt_records_controls_hardware_and_separate_clocks(
     assert receipt["managed_environment"]["XDG_CACHE_HOME"] == "/shared/cache"
     assert receipt["clocks"]["notebook_start_epoch"] == 100.0
     assert receipt["clocks"]["launcher_setup_seconds"] == 10.0
+    assert any(
+        "--linear-attn-verify-backend triton" in difference
+        for difference in receipt["differences_from_notebook"]
+    )
     assert receipt["command"].endswith("10.15.0.15")
 
 
