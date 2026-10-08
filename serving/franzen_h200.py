@@ -16,6 +16,7 @@ import shlex
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -44,6 +45,52 @@ GPU_QUERY = (
 )
 PRECACHE_BLOCK_BYTES = 32 * 1024 * 1024
 GPU_STATIC_MEMORY_FRACTION = 0.96
+QSA_FP8_PATCH_BEFORE_SHA256 = "2ce24d66d6a0bff0e22ff0819291649a4169937f32c5c28241215c6eb119ad54"
+QSA_FP8_PATCH_AFTER_SHA256 = "e5e08c37c603b2977d4b93ce1395185bc595be029ed5cb84ee976f3acb221d2c"
+_QSA_FORWARD_EXTEND_ANCHOR = "    def forward_extend(\n"
+_QSA_FORWARD_EXTEND_REPLACEMENT = '''    @staticmethod
+    def _require_unit_qsa_kv_scales(kwargs):
+        for name in ("k_scale", "v_scale"):
+            scale = kwargs.get(name, 1.0)
+            if type(scale) not in (int, float) or scale != 1.0:
+                raise ValueError(
+                    "SM90 QSA FP8 compute scratch supports unit K/V cache scales only"
+                )
+
+    def forward_extend(
+'''
+_QSA_STORE_ANCHOR = '''        if save_kv_cache:
+            self.token_to_kv_pool.set_kv_buffer(
+                layer, forward_batch.out_cache_loc, k, v
+            )
+'''
+_QSA_STORE_REPLACEMENT = '''        if save_kv_cache:
+            self._require_unit_qsa_kv_scales(kwargs)
+            self.token_to_kv_pool.set_kv_buffer(
+                layer,
+                forward_batch.out_cache_loc,
+                k,
+                v,
+                k_scale=1.0,
+                v_scale=1.0,
+            )
+'''
+_QSA_SCRATCH_ANCHOR = '''        packed_k, packed_v = self._get_fa2_scratch(
+            scratch_capacity,
+            k_buffer.shape[1],
+            k_buffer.shape[2],
+            k_buffer.dtype,
+            k_buffer.device,
+        )
+'''
+_QSA_SCRATCH_REPLACEMENT = '''        packed_k, packed_v = self._get_fa2_scratch(
+            scratch_capacity,
+            k_buffer.shape[1],
+            k_buffer.shape[2],
+            q.dtype if k_buffer.dtype == torch.float8_e4m3fn else k_buffer.dtype,
+            k_buffer.device,
+        )
+'''
 
 
 class Flags(Protocol):
@@ -57,6 +104,7 @@ class Flags(Protocol):
     startup_timeout: int
     notebook_start_epoch: float | None
     prepare_only: bool
+    qsa_fp8_compute_scratch: bool
     bind_host: str
     linear_attn_verify_backend: Literal["triton"] | None
 
@@ -412,6 +460,8 @@ def main(argv: list[str] | None = None) -> int:
     paths.work_dir.mkdir(parents=True, exist_ok=True)
     runtime_environment = h200_environment(base=dict(os.environ))
     if flags.prepare_only:
+        if flags.qsa_fp8_compute_scratch:
+            raise ValueError("QSA source patches apply only to a serve launch")
         _precache_paths(
             (paths.wheelhouse,),
             threads=16,
@@ -457,6 +507,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     _precache_paths((paths.wheelhouse,), threads=16, log=paths.work_dir / "precache.log")
     install_receipt = _setup_venv(paths, runtime_environment)
+    qsa_source = _qsa_source_file(paths.venv)
+    qsa_patch = apply_qsa_fp8_scratch_patch(
+        qsa_source,
+        enabled=flags.qsa_fp8_compute_scratch,
+    )
     cuda_home, c_compiler, cxx_compiler = _prepare_cuda(paths)
     runtime_environment = _runtime_environment(
         base=runtime_environment,
@@ -498,6 +553,7 @@ def main(argv: list[str] | None = None) -> int:
         draft_config_sha256=_sha256(draft_view / "config.json"),
         draft_index_sha256=_sha256(draft_view / "model.safetensors.index.json"),
         linear_attn_verify_backend=flags.linear_attn_verify_backend,
+        qsa_patch=qsa_patch,
     )
     precache_cancel = threading.Event()
     model_precache = threading.Thread(
@@ -546,6 +602,91 @@ def validate_fr_spec_assets(*, token_map: Path, tokenizer: Path) -> tuple[str, s
     if tokenizer_digest != TOKENIZER_SHA256:
         raise ValueError("The target tokenizer differs from the pinned FR-Spec tokenizer")
     return token_map_digest, tokenizer_digest
+
+
+def apply_qsa_fp8_scratch_patch(path: Path, *, enabled: bool) -> dict[str, object]:
+    """Apply only the source-pinned QSA SM90 FP8-gather patch when selected."""
+    source = path.read_text()
+    before_sha256 = _sha256(path)
+    if before_sha256 == QSA_FP8_PATCH_AFTER_SHA256:
+        if not enabled:
+            raise ValueError("QSA source is patched; the QSA compatibility selector is required")
+        return {
+            "enabled": True,
+            "status": "already_applied",
+            "path": str(path),
+            "before_sha256": QSA_FP8_PATCH_BEFORE_SHA256,
+            "after_sha256": QSA_FP8_PATCH_AFTER_SHA256,
+        }
+    if before_sha256 != QSA_FP8_PATCH_BEFORE_SHA256:
+        raise ValueError(
+            f"QSA source hash differs from pinned base: {before_sha256}",
+        )
+    receipt: dict[str, object] = {
+        "enabled": enabled,
+        "status": "unpatched",
+        "path": str(path),
+        "before_sha256": before_sha256,
+        "after_sha256": before_sha256,
+    }
+    if not enabled:
+        return receipt
+    patched_source = _apply_qsa_patch_text(source)
+    after_sha256 = hashlib.sha256(patched_source.encode()).hexdigest()
+    if after_sha256 != QSA_FP8_PATCH_AFTER_SHA256:
+        raise RuntimeError(
+            "QSA patch output hash differs from its reviewed after seal: "
+            f"{after_sha256}",
+        )
+    temporary = path.with_name(f".{path.name}.qsa-patch.pending")
+    file_mode = stat.S_IMODE(path.stat().st_mode)
+    try:
+        temporary.write_text(patched_source)
+        temporary.chmod(file_mode)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    if _sha256(path) != after_sha256:
+        raise RuntimeError("QSA source did not retain the reviewed after seal")
+    return {
+        "enabled": True,
+        "status": "applied",
+        "path": str(path),
+        "before_sha256": before_sha256,
+        "after_sha256": after_sha256,
+    }
+
+
+def _apply_qsa_patch_text(source: str) -> str:
+    replacements = (
+        (_QSA_FORWARD_EXTEND_ANCHOR, _QSA_FORWARD_EXTEND_REPLACEMENT, 1),
+        (_QSA_STORE_ANCHOR, _QSA_STORE_REPLACEMENT, 2),
+        (_QSA_SCRATCH_ANCHOR, _QSA_SCRATCH_REPLACEMENT, 1),
+    )
+    for original, replacement, expected_count in replacements:
+        count = source.count(original)
+        if count != expected_count:
+            raise ValueError(
+                "QSA source patch anchor count differs: "
+                f"expected {expected_count}, found {count}",
+            )
+        source = source.replace(original, replacement)
+    return source
+
+
+def _qsa_source_file(venv: Path) -> Path:
+    candidates = sorted(
+        venv.glob(
+            "lib/python*/site-packages/sglang/srt/layers/attention/"
+            "qwen_sparse_attn_backend.py",
+        ),
+    )
+    if len(candidates) != 1:
+        raise ValueError(
+            "Expected one installed qwen_sparse_attn_backend.py, "
+            f"found {len(candidates)} under {venv}",
+        )
+    return candidates[0]
 
 
 def validate_gpu_admission(
@@ -688,6 +829,7 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         choices=("triton",),
         default=None,
     )
+    parser.add_argument("--qsa-fp8-compute-scratch", action="store_true")
     parser.add_argument("--prepare-only", action="store_true")
 
 
@@ -990,6 +1132,7 @@ def _write_launch_metadata(
     draft_config_sha256: str,
     draft_index_sha256: str,
     linear_attn_verify_backend: Literal["triton"] | None,
+    qsa_patch: dict[str, object],
 ) -> None:
     controlled_names = (
         "PYTHONNOUSERSITE",
@@ -1050,6 +1193,10 @@ def _write_launch_metadata(
         differences.append(
             f"Explicit compatibility override: --linear-attn-verify-backend {linear_attn_verify_backend}.",
         )
+    if qsa_patch["enabled"]:
+        differences.append(
+            "Explicit source-pinned QSA FP8-to-query-dtype selected-K/V scratch patch applied.",
+        )
     metadata = {
         "schema": "franzen-h200-launch.v1",
         "created_utc": _utc_now(),
@@ -1060,6 +1207,7 @@ def _write_launch_metadata(
         "expected_gpu": {"name": "NVIDIA H200", "compute_capability": "9.0"},
         "differences_from_notebook": differences,
         "linear_attn_verify_backend_override": linear_attn_verify_backend,
+        "qsa_fp8_compute_scratch_patch": qsa_patch,
         "clocks": {
             "notebook_start_epoch": started,
             "launcher_setup_started_epoch": setup_started,

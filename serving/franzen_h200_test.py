@@ -128,6 +128,53 @@ def test_explicit_triton_verify_override_changes_only_one_argv_pair(
     assert _option_value(retry, "--speculative-draft-kv-cache-dtype") == "fp8_e4m3"
 
 
+def test_qsa_scratch_patch_is_exact_hashed_opt_in_and_idempotent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from serving import franzen_h200
+
+    source = (
+        franzen_h200._QSA_FORWARD_EXTEND_ANCHOR
+        + franzen_h200._QSA_STORE_ANCHOR * 2
+        + franzen_h200._QSA_SCRATCH_ANCHOR
+    )
+    expected = franzen_h200._apply_qsa_patch_text(source)
+    monkeypatch.setattr(franzen_h200, "QSA_FP8_PATCH_BEFORE_SHA256", _text_digest(source))
+    monkeypatch.setattr(franzen_h200, "QSA_FP8_PATCH_AFTER_SHA256", _text_digest(expected))
+    path = tmp_path / "qwen_sparse_attn_backend.py"
+    path.write_text(source)
+
+    untouched = franzen_h200.apply_qsa_fp8_scratch_patch(path, enabled=False)
+    assert untouched["status"] == "unpatched"
+    assert path.read_text() == source
+
+    applied = franzen_h200.apply_qsa_fp8_scratch_patch(path, enabled=True)
+    assert applied["status"] == "applied"
+    assert path.read_text() == expected
+    assert expected.count("k_scale=1.0") == 2
+    assert expected.count("v_scale=1.0") == 2
+    assert "q.dtype if k_buffer.dtype == torch.float8_e4m3fn" in expected
+    repeated = franzen_h200.apply_qsa_fp8_scratch_patch(path, enabled=True)
+    assert repeated["status"] == "already_applied"
+    with pytest.raises(ValueError, match="selector is required"):
+        franzen_h200.apply_qsa_fp8_scratch_patch(path, enabled=False)
+
+
+def test_qsa_scratch_patch_refuses_an_unknown_source_hash(tmp_path: Path) -> None:
+    from serving import franzen_h200
+
+    path = tmp_path / "qwen_sparse_attn_backend.py"
+    path.write_text("other source")
+
+    with pytest.raises(ValueError, match="source hash differs"):
+        franzen_h200.apply_qsa_fp8_scratch_patch(path, enabled=True)
+
+
+def _text_digest(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
 def test_h200_environment_is_explicit_without_disabling_mtp_or_fp8() -> None:
     environment = h200_environment(
         base={"PATH": "/usr/bin", "TORCH_CUDA_ARCH_LIST": "12.0"},
@@ -336,6 +383,13 @@ def test_launch_receipt_records_controls_hardware_and_separate_clocks(
         draft_config_sha256="e" * 64,
         draft_index_sha256="f" * 64,
         linear_attn_verify_backend="triton",
+        qsa_patch={
+            "enabled": True,
+            "status": "applied",
+            "path": "/pinned/qwen_sparse_attn_backend.py",
+            "before_sha256": "b" * 64,
+            "after_sha256": "a" * 64,
+        },
     )
 
     receipt = json.loads(paths.metadata.read_text())
@@ -346,6 +400,11 @@ def test_launch_receipt_records_controls_hardware_and_separate_clocks(
     assert receipt["clocks"]["launcher_setup_seconds"] == 10.0
     assert any(
         "--linear-attn-verify-backend triton" in difference
+        for difference in receipt["differences_from_notebook"]
+    )
+    assert receipt["qsa_fp8_compute_scratch_patch"]["after_sha256"] == "a" * 64
+    assert any(
+        "QSA FP8-to-query-dtype" in difference
         for difference in receipt["differences_from_notebook"]
     )
     assert receipt["command"].endswith("10.15.0.15")
@@ -554,6 +613,7 @@ def test_cli_help_exposes_required_paths(capsys: pytest.CaptureFixture[str]) -> 
     assert "--port" in output
     assert "--prepare-only" in output
     assert "--bind-host" in output
+    assert "--qsa-fp8-compute-scratch" in output
 
 
 def test_prepare_only_needs_no_model_paths_or_gpu(
