@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from serving.qsa_probe.runner import (
     _require_bad_control_rejected,
+    _valid_prefix_counts,
+    _write_failure_diagnostic,
     main,
     probe_case_specs,
 )
@@ -29,6 +33,15 @@ def test_probe_matrix_covers_decode_target_verify_draft_and_empty_mask() -> None
         )
         for index in row
     )
+    assert [
+        _valid_prefix_counts(case.sequence_lengths, case.selected_indices)
+        for case in cases
+    ] == [(3,), (3, 4, 0, 4), (3, 4, 5, 3)]
+
+
+def test_probe_mask_contract_rejects_valid_index_after_invalid_slot() -> None:
+    with pytest.raises(ValueError, match="valid indices must be a prefix"):
+        _valid_prefix_counts((5,), ((0, -1, 2, 4, 5),))
 
 
 def test_probe_requires_explicit_execution_flag(capsys: pytest.CaptureFixture[str]) -> None:
@@ -58,3 +71,37 @@ def test_probe_requires_known_bad_fp8_control_to_fail() -> None:
         _require_bad_control_rejected({"rejected": False})
 
     _require_bad_control_rejected({"rejected": True})
+
+
+def test_probe_writes_case_evidence_before_propagating_failure(tmp_path) -> None:
+    output = tmp_path / "probe-failure.json"
+    evidence = {
+        "query": {"dtype": "torch.bfloat16", "shape": [1, 2, 64], "values": [[[0.0]]] },
+        "cache": {"dtype": "torch.float8_e4m3fn", "shape": [8, 1, 64], "values": [[[1.0]]] },
+        "indices": [[0, 4, 5, -1, 2]],
+        "valid_counts": [3],
+        "gathered_scratch": [[[1.0]]],
+        "output": [[[0.2]]],
+        "reference": [[[0.1]]],
+    }
+
+    _write_failure_diagnostic(
+        output,
+        vendor_file="/runtime/qwen_sparse_attn_backend.py",
+        vendor_sha256="a" * 64,
+        gpu={"name": "NVIDIA H200", "capability": [9, 0]},
+        case="decode-one",
+        error=AssertionError("attention output differs"),
+        evidence=evidence,
+    )
+
+    receipt = json.loads(output.read_text())
+    assert receipt["status"] == "failed"
+    assert receipt["failure"] == {
+        "type": "AssertionError",
+        "message": "attention output differs",
+    }
+    assert receipt["case_evidence"]["valid_counts"] == [3]
+    assert receipt["case_evidence"]["gathered_scratch"] == [[[1.0]]]
+    assert receipt["case_evidence"]["output"] == [[[0.2]]]
+    assert receipt["case_evidence"]["reference"] == [[[0.1]]]

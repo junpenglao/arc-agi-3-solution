@@ -61,15 +61,15 @@ def probe_case_specs() -> tuple[ProbeCase, ...]:
         ProbeCase(
             name="decode-one",
             sequence_lengths=(5,),
-            selected_indices=((0, 4, 5, -1, 2),),
+            selected_indices=((0, 4, 2, 5, -1),),
             caller="forward_decode",
         ),
         ProbeCase(
             name="target-verify-four",
             sequence_lengths=(4, 5, 6, 7),
             selected_indices=(
-                (0, 3, -1, 99, 1),
-                (4, 0, 3, 7, 2),
+                (0, 3, 1, -1, 99),
+                (4, 0, 3, 2, 7),
                 (-1, -1, -1, -1, -1),
                 (6, 2, 5, 4, 99),
             ),
@@ -89,6 +89,28 @@ def probe_case_specs() -> tuple[ProbeCase, ...]:
     )
 
 
+def _valid_prefix_counts(
+    sequence_lengths: tuple[int, ...],
+    selected_indices: tuple[tuple[int, ...], ...],
+) -> tuple[int, ...]:
+    counts: list[int] = []
+    for sequence_length, row_indices in zip(sequence_lengths, selected_indices, strict=True):
+        valid_count = 0
+        invalid_seen = False
+        for index in row_indices:
+            if 0 <= index < sequence_length:
+                if invalid_seen:
+                    raise ValueError(
+                        "QSA selected indices must be valid indices first; "
+                        "valid indices must be a prefix of each row",
+                    )
+                valid_count += 1
+            else:
+                invalid_seen = True
+        counts.append(valid_count)
+    return tuple(counts)
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the explicit GPU probe and write a durable JSON receipt."""
     parser = argparse.ArgumentParser(description=(__doc__ or "").strip())
@@ -99,7 +121,7 @@ def main(argv: list[str] | None = None) -> int:
     if not flags.run:
         parser.error("this probe performs GPU work; pass --run explicitly after review")
     _validate_vendor_file(flags.vendor_file)
-    receipt = _run_probe(flags.vendor_file)
+    receipt = _run_probe(flags.vendor_file, diagnostic_output=flags.output)
     flags.output.parent.mkdir(parents=True, exist_ok=True)
     temporary = flags.output.with_name(f".{flags.output.name}.pending")
     temporary.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
@@ -117,7 +139,7 @@ def _validate_vendor_file(path: Path) -> None:
         )
 
 
-def _run_probe(vendor_file: Path) -> dict[str, object]:
+def _run_probe(vendor_file: Path, *, diagnostic_output: Path) -> dict[str, object]:
     import torch
 
     from sglang.srt.layers.attention import qwen_sparse_attn_backend as qsa
@@ -155,25 +177,50 @@ def _run_probe(vendor_file: Path) -> dict[str, object]:
     varlen = qsa._resolve_flash_attn_varlen_func()
     result_rows = []
     for case in probe_case_specs():
-        output, selected = _run_case(
-            torch=torch,
-            qsa=qsa,
-            varlen=varlen,
-            case=case,
-            key_cache=key_cache,
-            value_cache=value_cache,
-        )
-        reference = _bf16_attention_reference(
-            torch=torch,
-            queries=selected["queries"],
-            key_cache=initial_key,
-            value_cache=initial_value,
-            sequence_lengths=case.sequence_lengths,
-            selected_indices=case.selected_indices,
-            scale=selected["scale"],
-        )
-        torch.testing.assert_close(output, reference, rtol=0.04, atol=0.04)
-        _assert_gathered_scratch(torch, selected, initial_key, initial_value, case)
+        diagnostics: dict[str, object] = {
+            "initial_key_cache": initial_key,
+            "initial_value_cache": initial_value,
+            "case_sequence_lengths": list(case.sequence_lengths),
+            "case_selected_indices": [list(row) for row in case.selected_indices],
+        }
+        try:
+            output, selected = _run_case(
+                torch=torch,
+                qsa=qsa,
+                varlen=varlen,
+                case=case,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                diagnostics=diagnostics,
+            )
+            diagnostics.update(selected)
+            _assert_gathered_scratch(torch, selected, initial_key, initial_value, case)
+            diagnostics["gather_verified"] = True
+            reference = _bf16_attention_reference(
+                torch=torch,
+                queries=selected["queries"],
+                key_cache=initial_key,
+                value_cache=initial_value,
+                sequence_lengths=case.sequence_lengths,
+                selected_indices=case.selected_indices,
+                scale=selected["scale"],
+            )
+            diagnostics["output"] = output
+            diagnostics["reference"] = reference
+            max_abs_error = float((output.float() - reference.float()).abs().max())
+            diagnostics["max_abs_error"] = max_abs_error
+            torch.testing.assert_close(output, reference, rtol=0.04, atol=0.04)
+        except Exception as error:
+            _write_failure_diagnostic(
+                diagnostic_output,
+                vendor_file=str(module_path),
+                vendor_sha256=_sha256(module_path),
+                gpu={"name": device_name, "capability": list(capability)},
+                case=case.name,
+                error=error,
+                evidence=_snapshot_evidence(torch, diagnostics),
+            )
+            raise
         result_rows.append(
             {
                 "case": case.name,
@@ -181,7 +228,7 @@ def _run_probe(vendor_file: Path) -> dict[str, object]:
                 "query_rows": case.query_rows,
                 "sequence_lengths": list(case.sequence_lengths),
                 "selected_indices": [list(row) for row in case.selected_indices],
-                "output_max_abs_error": float((output.float() - reference.float()).abs().max()),
+                "output_max_abs_error": max_abs_error,
                 "scratch_dtype": str(selected["scratch_k"].dtype),
                 "masked_counts": selected["valid_counts"].cpu().tolist(),
             },
@@ -218,7 +265,12 @@ def _run_case(
     case: ProbeCase,
     key_cache,
     value_cache,
+    diagnostics: dict[str, object],
 ) -> tuple[object, dict[str, object]]:
+    expected_valid_counts = _valid_prefix_counts(
+        case.sequence_lengths,
+        case.selected_indices,
+    )
     query_rows = case.query_rows
     query_heads = 2
     kv_heads = 1
@@ -262,26 +314,6 @@ def _run_case(
         head_dim=head_dim,
         scaling=head_dim**-0.5,
     )
-    if case.caller == "forward_extend":
-        output = backend.forward_extend(
-            queries,
-            key_cache[:query_rows],
-            value_cache[:query_rows],
-            layer,
-            forward_batch,
-            save_kv_cache=False,
-            topk_indices=indices,
-        )
-    else:
-        output = backend.forward_decode(
-            queries,
-            key_cache[:query_rows],
-            value_cache[:query_rows],
-            layer,
-            forward_batch,
-            save_kv_cache=False,
-            topk_indices=indices,
-        )
     valid_counts = torch.empty(query_rows, dtype=torch.int32, device="cuda")
     cu_seqlens_k = torch.empty(query_rows + 1, dtype=torch.int32, device="cuda")
     cu_seqlens_q = torch.arange(query_rows + 1, dtype=torch.int32, device="cuda")
@@ -293,7 +325,55 @@ def _run_case(
         query_rows,
         indices.shape[1],
     )
+    diagnostics.update(
+        {
+            "queries": queries,
+            "query_scale": layer.scaling,
+            "persistent_key_cache": key_cache,
+            "persistent_value_cache": value_cache,
+            "indices": indices,
+            "sequence_lengths": sequence_lengths,
+            "valid_counts": valid_counts,
+            "expected_valid_counts": list(expected_valid_counts),
+            "cu_seqlens_k": cu_seqlens_k,
+            "cu_seqlens_q": cu_seqlens_q,
+        },
+    )
+    if valid_counts.cpu().tolist() != list(expected_valid_counts):
+        raise AssertionError("QSA valid-count kernel differs from the fixture mask contract")
+    try:
+        if case.caller == "forward_extend":
+            output = backend.forward_extend(
+                queries,
+                key_cache[:query_rows],
+                value_cache[:query_rows],
+                layer,
+                forward_batch,
+                save_kv_cache=False,
+                topk_indices=indices,
+            )
+        else:
+            output = backend.forward_decode(
+                queries,
+                key_cache[:query_rows],
+                value_cache[:query_rows],
+                layer,
+                forward_batch,
+                save_kv_cache=False,
+                topk_indices=indices,
+            )
+    finally:
+        scratch = backend._fa2_scratch.get(
+            (kv_heads, head_dim, queries.dtype, queries.device),
+        )
+        if scratch is not None:
+            selected_scratch_rows = int(valid_counts.sum().item())
+            diagnostics["scratch_k"] = scratch[0][:selected_scratch_rows]
+            diagnostics["scratch_v"] = scratch[1][:selected_scratch_rows]
     scratch_k, scratch_v = backend._fa2_scratch[(kv_heads, head_dim, queries.dtype, queries.device)]
+    selected_scratch_rows = int(valid_counts.sum().item())
+    scratch_k = scratch_k[:selected_scratch_rows]
+    scratch_v = scratch_v[:selected_scratch_rows]
     return output.reshape_as(queries), {
         "queries": queries,
         "indices": indices,
@@ -304,8 +384,6 @@ def _run_case(
         "scratch_k": scratch_k,
         "scratch_v": scratch_v,
         "scale": layer.scaling,
-        "varlen": varlen,
-        "qsa": qsa,
     }
 
 
@@ -433,6 +511,57 @@ def _known_bad_fp8_scratch_control(
 def _require_bad_control_rejected(result: dict[str, object]) -> None:
     if result.get("rejected") is not True:
         raise AssertionError("known-bad FP8 scratch control was not rejected")
+
+
+def _write_failure_diagnostic(
+    output: Path,
+    *,
+    vendor_file: str,
+    vendor_sha256: str,
+    gpu: dict[str, object],
+    case: str,
+    error: Exception,
+    evidence: dict[str, object],
+) -> None:
+    receipt = {
+        "schema": "franzen-qsa-sm90-fp8-scratch-probe.v1",
+        "status": "failed",
+        "vendor_file": vendor_file,
+        "vendor_sha256": vendor_sha256,
+        "gpu": gpu,
+        "case": case,
+        "failure": {"type": type(error).__name__, "message": str(error)},
+        "case_evidence": evidence,
+    }
+    _write_receipt(output, receipt)
+
+
+def _snapshot_evidence(torch, evidence: dict[str, object]) -> dict[str, object]:
+    def snapshot(value: object) -> object:
+        if isinstance(value, torch.Tensor):
+            cpu_value = value.detach().cpu()
+            visible = cpu_value.float() if cpu_value.is_floating_point() else cpu_value
+            return {
+                "dtype": str(cpu_value.dtype),
+                "shape": list(cpu_value.shape),
+                "values": visible.tolist(),
+            }
+        if isinstance(value, dict):
+            return {str(name): snapshot(item) for name, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [snapshot(item) for item in value]
+        if value is None or type(value) in (str, int, float, bool):
+            return value
+        return repr(value)
+
+    return {name: snapshot(value) for name, value in evidence.items()}
+
+
+def _write_receipt(output: Path, receipt: dict[str, object]) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_name(f".{output.name}.pending")
+    temporary.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
+    temporary.replace(output)
 
 
 def _sha256(path: Path) -> str:
