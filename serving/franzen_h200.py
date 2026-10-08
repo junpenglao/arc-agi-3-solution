@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import csv
 import email.parser
+import fcntl
 import hashlib
+import http.client
 import json
 import math
 import os
@@ -24,10 +26,11 @@ import time
 import urllib.error
 import urllib.request
 import zipfile
+from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal, Protocol, cast
+from typing import Iterator, Literal, Protocol, cast
 
 
 NOTEBOOK_SOURCE_SHA256 = "25879d2fee20cbf91a4ccd684477ad5db69f0d2e36d81a1de1dd49bb68e4210d"
@@ -48,6 +51,8 @@ GPU_STATIC_MEMORY_FRACTION = 0.96
 GROUP_TERMINATION_GRACE_SECONDS = 10
 GROUP_KILL_WAIT_SECONDS = 10
 GROUP_POLL_INTERVAL_SECONDS = 0.1
+GPU_QUERY_TIMEOUT_SECONDS = 30
+SETUP_COMMAND_TIMEOUT_SECONDS = 1800
 QSA_FP8_PATCH_BEFORE_SHA256 = "2ce24d66d6a0bff0e22ff0819291649a4169937f32c5c28241215c6eb119ad54"
 QSA_FP8_PATCH_AFTER_SHA256 = "e5e08c37c603b2977d4b93ce1395185bc595be029ed5cb84ee976f3acb221d2c"
 QSA_MTP_HOLE_BEFORE_SHA256 = QSA_FP8_PATCH_AFTER_SHA256
@@ -139,7 +144,7 @@ class RuntimePaths:
     wheelhouse: Path
     wheels: Path
     lock: Path
-    token_map: Path
+    token_map: Path | None
     work_dir: Path
     venv: Path
     python: Path
@@ -149,6 +154,7 @@ class RuntimePaths:
     install_metadata: Path
     metrics: Path
     pid_file: Path
+    lock_file: Path
 
 
 def build_server_argv(
@@ -188,7 +194,7 @@ def build_server_argv(
         "--kv-cache-dtype",
         "fp8_e4m3",
         "--mem-fraction-static",
-        "0.96",
+        f"{GPU_STATIC_MEMORY_FRACTION:.2f}",
         "--context-length",
         "139264",
         "--page-size",
@@ -437,6 +443,7 @@ def prepare_draft_view(
             "source": str(source.resolve()),
             "target": str(target),
             "config": adapted,
+            "source_index_sha256": _sha256(source / "model.safetensors.index.json"),
         },
         sort_keys=True,
     )
@@ -469,19 +476,67 @@ def prepare_draft_view(
                 raise ValueError(f"Unexpected existing draft-view file: {destination}")
         else:
             destination.symlink_to(source_path.resolve())
+    expected_inventory = {Path("config.json"), *(Path(name) for name in links)}
+    actual_inventory = {
+        path.relative_to(view)
+        for path in view.rglob("*")
+        if path.is_file() or path.is_symlink()
+    }
+    if actual_inventory != expected_inventory:
+        raise ValueError(
+            "unexpected draft-view inventory: "
+            f"extra={sorted(actual_inventory - expected_inventory)}, "
+            f"missing={sorted(expected_inventory - actual_inventory)}",
+        )
     return view
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run the H200 serving launcher; return zero only after health is ready."""
+    """Prepare the CPU runtime or supervise the H200 server until it exits."""
     parser = argparse.ArgumentParser(description=(__doc__ or "").strip())
     _add_arguments(parser)
     flags = cast(Flags, parser.parse_args(argv))
+    _validate_startup_timeout(flags.startup_timeout)
     if flags.qsa_mtp_hole_compaction and not flags.qsa_fp8_compute_scratch:
         raise ValueError("QSA MTP hole compaction requires --qsa-fp8-compute-scratch")
     paths = _resolve_paths(flags)
-    paths.work_dir.mkdir(parents=True, exist_ok=True)
     runtime_environment = h200_environment(base=dict(os.environ))
+    if not flags.prepare_only:
+        _require_shared_cache_root(runtime_environment)
+    if not flags.prepare_only:
+        if paths.token_map is None:
+            raise ValueError("Serving requires an FR-Spec token map in the wheelhouse")
+        if paths.target_dir is None or paths.draft_dir is None or flags.port is None:
+            raise ValueError(
+                "Serving requires --target-dir, --draft-dir and --port; "
+                "use --prepare-only for CPU venv setup.",
+            )
+        _require_unoccupied_port(flags.bind_host, flags.port)
+    paths.work_dir.mkdir(parents=True, exist_ok=True)
+    with _workdir_lock(paths):
+        return _serve_resolved(flags, paths, runtime_environment)
+
+
+@contextmanager
+def _workdir_lock(paths: RuntimePaths) -> Iterator[None]:
+    with paths.lock_file.open("a", encoding="utf-8") as lock_file:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RuntimeError(
+                f"Server work directory is already locked: {paths.work_dir}",
+            ) from error
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _serve_resolved(
+    flags: Flags,
+    paths: RuntimePaths,
+    runtime_environment: dict[str, str],
+) -> int:
     if flags.prepare_only:
         if flags.qsa_fp8_compute_scratch or flags.qsa_mtp_hole_compaction:
             raise ValueError("QSA source patches apply only to a serve launch")
@@ -496,17 +551,11 @@ def main(argv: list[str] | None = None) -> int:
             f"setup receipt: {paths.install_metadata}",
         )
         return 0
-    if paths.target_dir is None or paths.draft_dir is None or flags.port is None:
-        raise ValueError(
-            "Serving requires --target-dir, --draft-dir and --port; "
-            "use --prepare-only for CPU venv setup.",
-        )
     started = (
         flags.notebook_start_epoch
         if flags.notebook_start_epoch is not None
         else time.time()
     )
-    _require_unoccupied_port(flags.bind_host, flags.port)
     setup_started = time.time()
     target_config = _read_object(paths.target_dir / "config.json")
     quantization = _object(target_config.get("quantization_config"))
@@ -548,6 +597,7 @@ def main(argv: list[str] | None = None) -> int:
         cxx_compiler=cxx_compiler,
     )
     _run_logged([str(cuda_home / "bin/nvcc"), "--version"], runtime_environment, paths)
+    gpu, admission = _refresh_launch_admission(paths=paths, environment=os.environ)
     setup_completed = time.time()
     chat_template = paths.target_dir / "chat_template.jinja"
     server_argv = build_server_argv(
@@ -821,6 +871,25 @@ def validate_gpu_admission(
     }
 
 
+def _refresh_launch_admission(
+    *,
+    paths: RuntimePaths,
+    environment: dict[str, str],
+) -> tuple[list[dict[str, object]], dict[str, object]]:
+    gpus = _query_gpu()
+    admission = validate_gpu_admission(gpus, environment=environment)
+    _append_jsonl(
+        paths.metrics,
+        {
+            "utc": _utc_now(),
+            "phase": "prelaunch",
+            "gpus": gpus,
+            "admission": admission,
+        },
+    )
+    return gpus, admission
+
+
 def _precache_paths(
     paths: tuple[Path, ...],
     *,
@@ -953,9 +1022,11 @@ def _resolve_paths(flags: Flags) -> RuntimePaths:
     candidates = sorted(wheels.glob("sglang-*.whl"))
     if len(candidates) != 1:
         raise ValueError(f"Expected one SGLang wheel, found {candidates}")
-    token_map = _find_optional(wheelhouse, "hot_tokens_64k.pt")
-    if token_map is None:
-        token_map = _find_unique(wheelhouse, "flash-next-64k.pt")
+    token_map = None
+    if not flags.prepare_only:
+        token_map = _find_optional(wheelhouse, "hot_tokens_64k.pt")
+        if token_map is None:
+            token_map = _find_unique(wheelhouse, "flash-next-64k.pt")
     venv = work_dir / "venv"
     return RuntimePaths(
         target_dir=target_dir,
@@ -973,6 +1044,7 @@ def _resolve_paths(flags: Flags) -> RuntimePaths:
         install_metadata=work_dir / "offline-install.json",
         metrics=work_dir / "gpu-metrics.jsonl",
         pid_file=work_dir / "server.pid",
+        lock_file=work_dir / ".serve.lock",
     )
 
 
@@ -1026,7 +1098,6 @@ def _setup_venv(
             _run_logged(list(command), environment, paths)
         _run_logged([str(paths.python), "-m", "pip", "check"], environment, paths)
         _verify_installed_sglang(paths, environment)
-        _write_json(marker, identity)
     else:
         _verify_installed_sglang(paths, environment)
     if mode == "installed":
@@ -1041,9 +1112,7 @@ def _setup_venv(
             "installer_sha256": _sha256(uv),
             "marker": str(marker),
         }
-        if paths.install_metadata.exists():
-            raise RuntimeError(f"Refusing to overwrite install receipt: {paths.install_metadata}")
-        _write_json(paths.install_metadata, receipt)
+        _publish_install_state(paths, identity, receipt)
         return receipt
     install_receipt = _read_object(paths.install_metadata)
     if install_receipt.get("identity") != identity:
@@ -1054,6 +1123,24 @@ def _setup_venv(
         "install_receipt_sha256": _sha256(paths.install_metadata),
         "identity": identity,
     }
+
+
+def _publish_install_state(
+    paths: RuntimePaths,
+    identity: dict[str, object],
+    receipt: dict[str, object],
+) -> None:
+    """Publish provenance before marking the offline venv complete."""
+    marker = paths.work_dir / "installed-bundle.json"
+    if paths.install_metadata.exists():
+        raise RuntimeError(f"Refusing to overwrite install receipt: {paths.install_metadata}")
+    try:
+        _write_json(paths.install_metadata, receipt)
+        _write_json(marker, identity)
+    except OSError as error:
+        raise RuntimeError(
+            f"Offline installation is incomplete; use a fresh --work-dir: {paths.venv}",
+        ) from error
 
 
 def _sglang_wheel_version(wheel: Path) -> str:
@@ -1136,22 +1223,7 @@ def _prepare_cuda(paths: RuntimePaths) -> tuple[Path, str, str]:
             link.symlink_to(shared_object.name)
     if not (lib / "libcudart.so").exists():
         raise RuntimeError("Bundled CUDA runtime library libcudart.so is missing")
-    if not (lib / "libcuda.so").exists():
-        locations = (
-            "/usr/local/nvidia/lib64",
-            "/usr/local/nvidia/lib",
-            "/usr/lib/x86_64-linux-gnu",
-            "/usr/lib64",
-        )
-        drivers = [
-            path
-            for location in locations
-            for path in sorted(Path(location).glob("libcuda.so*"))
-            if path.is_file()
-        ]
-        if not drivers:
-            raise RuntimeError("NVIDIA driver libcuda.so was not found in standard locations")
-        (lib / "libcuda.so").symlink_to(drivers[0].resolve())
+    _ensure_libcuda_link(lib)
     compiler = next(
         (
             name
@@ -1168,6 +1240,33 @@ def _prepare_cuda(paths: RuntimePaths) -> tuple[Path, str, str]:
     return cuda_home, c_compiler, compiler
 
 
+def _ensure_libcuda_link(
+    lib: Path,
+    *,
+    driver_locations: tuple[Path, ...] | None = None,
+) -> None:
+    link = lib / "libcuda.so"
+    if link.exists():
+        return
+    if link.is_symlink():
+        link.unlink()
+    locations = driver_locations or (
+        Path("/usr/local/nvidia/lib64"),
+        Path("/usr/local/nvidia/lib"),
+        Path("/usr/lib/x86_64-linux-gnu"),
+        Path("/usr/lib64"),
+    )
+    drivers = [
+        path
+        for location in locations
+        for path in sorted(location.glob("libcuda.so*"))
+        if path.is_file()
+    ]
+    if not drivers:
+        raise RuntimeError("NVIDIA driver libcuda.so was not found in standard locations")
+    link.symlink_to(drivers[0].resolve())
+
+
 def _runtime_environment(
     *,
     base: dict[str, str],
@@ -1177,10 +1276,7 @@ def _runtime_environment(
     cxx_compiler: str,
 ) -> dict[str, str]:
     environment = dict(base)
-    cache_root = environment.get("XDG_CACHE_HOME")
-    if not cache_root:
-        raise RuntimeError("Bind the provisioned shared XDG_CACHE_HOME before serving")
-    cache = Path(cache_root)
+    cache = _require_shared_cache_root(environment)
     shared_cache_defaults = {
         "HF_HOME": cache / "huggingface",
         "TORCH_HOME": cache / "torch",
@@ -1211,6 +1307,19 @@ def _runtime_environment(
         },
     )
     return environment
+
+
+def _require_shared_cache_root(environment: dict[str, str]) -> Path:
+    cache_root = environment.get("XDG_CACHE_HOME")
+    if not cache_root:
+        raise RuntimeError("Bind the provisioned shared XDG_CACHE_HOME before serving")
+    cache = Path(cache_root).expanduser()
+    if not cache.is_absolute() or not cache.is_dir():
+        raise RuntimeError(
+            "XDG_CACHE_HOME must name an existing absolute shared-cache directory: "
+            f"{cache}",
+        )
+    return cache
 
 
 def _write_launch_metadata(
@@ -1381,7 +1490,7 @@ def _launch_and_wait(
     metrics_started = False
     group_survivors = False
     return_code: int | None = None
-    process: subprocess.Popen[str] | None = None
+    process: subprocess.Popen[bytes] | None = None
     try:
         with paths.log.open("ab", buffering=0) as log_file:
             process = subprocess.Popen(
@@ -1419,7 +1528,11 @@ def _launch_and_wait(
                 try:
                     with urllib.request.urlopen(server_url, timeout=5) as response:
                         ready = response.status == 200
-                except (OSError, urllib.error.URLError):
+                except (
+                    OSError,
+                    urllib.error.URLError,
+                    http.client.HTTPException,
+                ):
                     ready = False
                 if ready:
                     _append_jsonl(
@@ -1506,10 +1619,10 @@ def _launch_and_wait(
         return 130
     if status in ("startup_timeout", "exited_before_ready"):
         return 2
-    return return_code if return_code != 0 else 2
+    return _normalize_server_exit_code(return_code) if return_code != 0 else 2
 
 
-def _terminate_process_group(process: subprocess.Popen[str]) -> bool:
+def _terminate_process_group(process: subprocess.Popen[bytes]) -> bool:
     """Terminate the owned session and report whether any member survived."""
     if not _process_group_exists(process):
         return False
@@ -1521,7 +1634,7 @@ def _terminate_process_group(process: subprocess.Popen[str]) -> bool:
 
 
 def _wait_for_process_group_exit(
-    process: subprocess.Popen[str],
+    process: subprocess.Popen[bytes],
     timeout: float,
 ) -> bool:
     deadline = time.monotonic() + timeout
@@ -1537,7 +1650,7 @@ def _wait_for_process_group_exit(
     return False
 
 
-def _process_group_exists(process: subprocess.Popen[str]) -> bool:
+def _process_group_exists(process: subprocess.Popen[bytes]) -> bool:
     try:
         os.killpg(process.pid, 0)
     except ProcessLookupError:
@@ -1547,7 +1660,7 @@ def _process_group_exists(process: subprocess.Popen[str]) -> bool:
     return True
 
 
-def _signal_process_group(process: subprocess.Popen[str], sig: signal.Signals) -> None:
+def _signal_process_group(process: subprocess.Popen[bytes], sig: signal.Signals) -> None:
     try:
         os.killpg(process.pid, sig)
     except ProcessLookupError:
@@ -1566,7 +1679,13 @@ def _record_gpu_metrics(path: Path, stop: threading.Event) -> None:
                 path,
                 {"utc": _utc_now(), "phase": "runtime", "gpus": _query_gpu()},
             )
-        except (OSError, RuntimeError, ValueError, subprocess.CalledProcessError) as error:
+        except (
+            OSError,
+            RuntimeError,
+            ValueError,
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+        ) as error:
             _append_jsonl(
                 path,
                 {
@@ -1587,6 +1706,7 @@ def _query_gpu() -> list[dict[str, object]]:
         check=True,
         capture_output=True,
         text=True,
+        timeout=GPU_QUERY_TIMEOUT_SECONDS,
     )
     return parse_gpu_metrics(result.stdout)
 
@@ -1599,21 +1719,50 @@ def _run_logged(
     with paths.log.open("a", encoding="utf-8") as log_file:
         log_file.write(f"$ {shlex.join(command)}\n")
         log_file.flush()
-        result = subprocess.run(
+        command_offset = log_file.tell()
+        process = subprocess.Popen(
             command,
             env=environment,
-            check=False,
-            capture_output=True,
-            text=True,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
         )
-        log_file.write(result.stdout)
-        log_file.write(result.stderr)
-    if result.returncode:
+        try:
+            return_code = process.wait(timeout=SETUP_COMMAND_TIMEOUT_SECONDS)
+        except KeyboardInterrupt:
+            process.kill()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired as cleanup_error:
+                raise RuntimeError(
+                    f"Interrupted command did not exit after kill: {shlex.join(command)}; "
+                    f"see {paths.log}\n{_log_excerpt(paths.log, command_offset)}",
+                ) from cleanup_error
+            raise
+        except subprocess.TimeoutExpired as error:
+            process.kill()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired as cleanup_error:
+                raise RuntimeError(
+                    f"Command timed out and did not exit after kill: {shlex.join(command)}; "
+                    f"see {paths.log}\n{_log_excerpt(paths.log, command_offset)}",
+                ) from cleanup_error
+            raise RuntimeError(
+                f"Command timed out after {SETUP_COMMAND_TIMEOUT_SECONDS}s: "
+                f"{shlex.join(command)}; see {paths.log}\n"
+                f"{_log_excerpt(paths.log, command_offset)}",
+            ) from error
+    output = _log_excerpt(paths.log, command_offset)
+    if return_code:
         raise RuntimeError(
-            f"Command failed ({result.returncode}): {shlex.join(command)}; "
-            f"see {paths.log}\n{_log_tail(paths.log)}",
+            f"Command failed ({return_code}): {shlex.join(command)}; "
+            f"see {paths.log}\n{output}",
         )
-    return result.stdout
+    return output
+
+
+def _normalize_server_exit_code(return_code: int) -> int:
+    return 128 + abs(return_code) if return_code < 0 else return_code
 
 
 def _exception_message(error: Exception) -> str:
@@ -1629,11 +1778,23 @@ def _exception_message(error: Exception) -> str:
 def _require_unoccupied_port(host: str, port: int) -> None:
     if port < 1 or port > 65535:
         raise ValueError(f"Port is outside the valid range: {port}")
-    with socket.socket() as probe:
-        if probe.connect_ex((host, port)) == 0:
-            raise RuntimeError(
-                f"Port {port} is occupied; stop the existing server before rerunning",
-            )
+    try:
+        addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except socket.gaierror as error:
+        raise ValueError(f"Cannot resolve bind host {host!r}: {error}") from error
+    if not addresses:
+        raise ValueError(f"Cannot resolve bind host {host!r}: no stream address")
+    for family, socket_type, protocol, _, address in addresses:
+        with socket.socket(family, socket_type, protocol) as probe:
+            if probe.connect_ex(address) == 0:
+                raise RuntimeError(
+                    f"Port {port} is occupied; stop the existing server before rerunning",
+                )
+
+
+def _validate_startup_timeout(timeout: int) -> None:
+    if timeout <= 0:
+        raise ValueError(f"Startup timeout must be positive, got {timeout}")
 
 
 def _show_log_tail(path: Path, *, offset: int) -> None:
@@ -1652,6 +1813,16 @@ def _log_tail(path: Path, *, limit: int = 20000) -> str:
     with path.open("rb") as log_file:
         log_file.seek(0, os.SEEK_END)
         log_file.seek(max(0, log_file.tell() - limit))
+        return log_file.read().decode(errors="replace")
+
+
+def _log_excerpt(path: Path, offset: int, *, limit: int = 20000) -> str:
+    if not path.is_file():
+        return ""
+    with path.open("rb") as log_file:
+        log_file.seek(0, os.SEEK_END)
+        end = log_file.tell()
+        log_file.seek(max(offset, end - limit))
         return log_file.read().decode(errors="replace")
 
 
@@ -1749,4 +1920,4 @@ def _number_or_none(value: str) -> float | int | None:
 
 
 def _utc_now() -> str:
-    return datetime.now(UTC).isoformat()
+    return datetime.now(timezone.utc).isoformat()

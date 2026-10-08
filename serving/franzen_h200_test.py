@@ -4,9 +4,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import argparse
+from dataclasses import replace
 import hashlib
+import http.client
 import json
 import signal
+import socket
 import stat
 import subprocess
 import threading
@@ -74,6 +78,7 @@ def test_server_argv_preserves_notebook_serving_controls(tmp_path: Path) -> None
     assert _option_value(args, "--context-length") == "139264"
     assert _option_value(args, "--max-running-requests") == "10"
     assert _option_value(args, "--kv-cache-dtype") == "fp8_e4m3"
+    assert _option_value(args, "--mem-fraction-static") == "0.96"
     assert _option_value(args, "--speculative-num-steps") == "3"
     assert _option_value(args, "--speculative-num-draft-tokens") == "4"
     assert _option_value(args, "--speculative-draft-model-path") == str(
@@ -86,6 +91,21 @@ def test_server_argv_preserves_notebook_serving_controls(tmp_path: Path) -> None
     assert _option_value(args, "--speculative-accept-threshold-single") == "1.0"
     assert _option_value(args, "--speculative-accept-threshold-acc") == "1.0"
     assert "--chat-template" in args
+    from serving.franzen_h200 import GPU_STATIC_MEMORY_FRACTION
+
+    assert GPU_STATIC_MEMORY_FRACTION == 0.96
+
+
+def test_launcher_process_group_annotations_match_binary_streams() -> None:
+    from serving import franzen_h200
+
+    assert franzen_h200._terminate_process_group.__annotations__["process"] == (
+        "subprocess.Popen[bytes]"
+    )
+    assert franzen_h200._signal_process_group.__annotations__["process"] == (
+        "subprocess.Popen[bytes]"
+    )
+    assert "supervise the H200 server until it exits" in franzen_h200.main.__doc__
 
 
 def test_server_argv_can_bind_to_the_private_host(tmp_path: Path) -> None:
@@ -100,6 +120,167 @@ def test_server_argv_can_bind_to_the_private_host(tmp_path: Path) -> None:
     )
 
     assert args[args.index("--host") + 1] == "10.15.0.15"
+
+
+@pytest.mark.parametrize(
+    ("family", "host", "address"),
+    [
+        (socket.AF_INET, "127.0.0.1", ("127.0.0.1", 8001)),
+        (socket.AF_INET6, "::1", ("::1", 8001, 0, 0)),
+    ],
+)
+def test_port_probe_uses_resolved_ipv4_or_ipv6_socket(
+    family: socket.AddressFamily,
+    host: str,
+    address: tuple[object, ...],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from serving import franzen_h200
+
+    sockets: list[tuple[int, tuple[object, ...]]] = []
+
+    class UnoccupiedSocket:
+        def __init__(self, socket_family: int) -> None:
+            self.family = socket_family
+
+        def __enter__(self) -> UnoccupiedSocket:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def connect_ex(self, sockaddr: tuple[object, ...]) -> int:
+            sockets.append((self.family, sockaddr))
+            return 111
+
+    monkeypatch.setattr(
+        franzen_h200.socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [(family, socket.SOCK_STREAM, 0, "", address)],
+    )
+    monkeypatch.setattr(
+        franzen_h200.socket,
+        "socket",
+        lambda socket_family, *_args: UnoccupiedSocket(socket_family),
+    )
+
+    franzen_h200._require_unoccupied_port(host, 8001)
+
+    assert sockets == [(family, address)]
+
+
+def test_port_probe_normalizes_invalid_host_and_rejects_occupied_ipv6(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from serving import franzen_h200
+
+    monkeypatch.setattr(
+        franzen_h200.socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(socket.gaierror("bad host")),
+    )
+    with pytest.raises(ValueError, match="bind host"):
+        franzen_h200._require_unoccupied_port("bad-host", 8001)
+
+    class OccupiedSocket:
+        def __enter__(self) -> OccupiedSocket:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def connect_ex(self, _sockaddr: tuple[object, ...]) -> int:
+            return 0
+
+    monkeypatch.setattr(
+        franzen_h200.socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (socket.AF_INET6, socket.SOCK_STREAM, 0, "", ("::1", 8001, 0, 0)),
+        ],
+    )
+    monkeypatch.setattr(
+        franzen_h200.socket,
+        "socket",
+        lambda *_args: OccupiedSocket(),
+    )
+    with pytest.raises(RuntimeError, match="Port 8001 is occupied"):
+        franzen_h200._require_unoccupied_port("::1", 8001)
+
+
+@pytest.mark.parametrize("timeout", [0, -1])
+def test_startup_timeout_must_be_positive(timeout: int) -> None:
+    from serving.franzen_h200 import _validate_startup_timeout
+
+    with pytest.raises(ValueError, match="Startup timeout must be positive"):
+        _validate_startup_timeout(timeout)
+
+
+def test_prepare_only_path_resolution_does_not_require_fr_spec_map(
+    tmp_path: Path,
+) -> None:
+    from serving.franzen_h200 import _add_arguments, _resolve_paths
+
+    wheelhouse = tmp_path / "wheelhouse"
+    wheels = wheelhouse / "wheels"
+    wheels.mkdir(parents=True)
+    (wheels / "sglang-test.whl").write_bytes(b"wheel")
+    (wheelhouse / "requirements.lock").write_text("locked")
+    parser = argparse.ArgumentParser()
+    _add_arguments(parser)
+    flags = parser.parse_args(
+        [
+            "--wheelhouse",
+            str(wheelhouse),
+            "--work-dir",
+            str(tmp_path / "work"),
+            "--prepare-only",
+        ],
+    )
+
+    paths = _resolve_paths(flags)
+
+    assert paths.token_map is None
+
+
+def test_missing_shared_cache_binding_fails_before_workdir_or_setup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from serving import franzen_h200
+
+    paths = replace(
+        _runtime_paths(tmp_path),
+        target_dir=tmp_path / "target",
+        draft_dir=tmp_path / "draft",
+    )
+    paths.work_dir.rmdir()
+    monkeypatch.setattr(franzen_h200, "_resolve_paths", lambda _flags: paths)
+    monkeypatch.setattr(franzen_h200, "h200_environment", lambda **_kwargs: {})
+    monkeypatch.setattr(franzen_h200, "_require_unoccupied_port", lambda *_args: None)
+    monkeypatch.setattr(
+        franzen_h200,
+        "_setup_venv",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("setup must not run")),
+    )
+
+    with pytest.raises(RuntimeError, match="shared XDG_CACHE_HOME"):
+        main(
+            [
+                "--target-dir",
+                "/target",
+                "--draft-dir",
+                "/draft",
+                "--wheelhouse",
+                "/wheelhouse",
+                "--work-dir",
+                str(paths.work_dir),
+                "--port",
+                "8001",
+            ],
+        )
+
+    assert not paths.work_dir.exists()
 
 
 def test_explicit_triton_verify_override_changes_only_one_argv_pair(
@@ -317,6 +498,28 @@ def test_gpu_admission_requires_one_slurm_h200_with_static_headroom() -> None:
         validate_gpu_admission(gpus, environment={})
 
 
+def test_final_launch_admission_records_a_fresh_gpu_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from serving import franzen_h200
+
+    paths = _runtime_paths(tmp_path)
+    gpus = parse_gpu_metrics("0, NVIDIA H200, 9.0, 143771, 615, 143156, 0, 75.72, 28\n")
+    monkeypatch.setattr(franzen_h200, "_query_gpu", lambda: gpus)
+
+    measured, admission = franzen_h200._refresh_launch_admission(
+        paths=paths,
+        environment={"SLURM_JOB_ID": "38699", "SLURM_JOB_GPUS": "0"},
+    )
+
+    assert measured == gpus
+    assert admission["slurm_job_id"] == "38699"
+    record = json.loads(paths.metrics.read_text())
+    assert record["phase"] == "prelaunch"
+    assert record["admission"] == admission
+
+
 def test_required_finder_has_non_optional_success_contract(tmp_path: Path) -> None:
     required = tmp_path / "required"
     required.write_text("value")
@@ -410,6 +613,46 @@ def test_reused_venv_keeps_original_install_receipt_immutable(
     assert _digest(paths.install_metadata) == before
 
 
+def test_workdir_lock_rejects_a_second_launcher_for_same_state(
+    tmp_path: Path,
+) -> None:
+    from serving.franzen_h200 import _workdir_lock
+
+    paths = _runtime_paths(tmp_path)
+    with _workdir_lock(paths):
+        with pytest.raises(RuntimeError, match="work directory is already locked"):
+            with _workdir_lock(paths):
+                raise AssertionError("a second launcher must not enter shared setup")
+
+
+@pytest.mark.parametrize("fail_at", ["receipt", "marker"])
+def test_install_completion_marker_is_last_publication_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fail_at: str,
+) -> None:
+    from serving import franzen_h200
+
+    paths = _runtime_paths(tmp_path)
+    marker = paths.work_dir / "installed-bundle.json"
+    identity = {"bundle": "pinned"}
+    receipt = {"identity": identity, "mode": "installed"}
+    original_write_json = franzen_h200._write_json
+    failure_path = paths.install_metadata if fail_at == "receipt" else marker
+
+    def write_json(path: Path, value: object) -> None:
+        if path == failure_path:
+            raise OSError(f"synthetic {fail_at} publication failure")
+        original_write_json(path, value)
+
+    monkeypatch.setattr(franzen_h200, "_write_json", write_json)
+    with pytest.raises(RuntimeError, match="incomplete"):
+        franzen_h200._publish_install_state(paths, identity, receipt)
+
+    assert marker.exists() is False
+    assert paths.install_metadata.exists() is (fail_at == "marker")
+
+
 def test_launch_receipt_records_controls_hardware_and_separate_clocks(
     tmp_path: Path,
 ) -> None:
@@ -486,7 +729,17 @@ def test_startup_timeout_terminates_and_reaps_owned_process_group(
     process = _FakeProcess((None, None, None))
     signals: list[int] = []
     group_alive = [True]
-    clock = iter((10.0, 10.0, 12.0, 12.0, 12.0, 12.0))
+
+    class ControlledClock:
+        current = 10.0
+
+        def monotonic(self) -> float:
+            return self.current
+
+        def sleep(self, seconds: float) -> None:
+            self.current += seconds
+
+    clock = ControlledClock()
     monkeypatch.setattr(franzen_h200.subprocess, "Popen", lambda *args, **kwargs: process)
     monkeypatch.setattr(franzen_h200, "_query_gpu", lambda: [])
     monkeypatch.setattr(
@@ -494,8 +747,8 @@ def test_startup_timeout_terminates_and_reaps_owned_process_group(
         "urlopen",
         lambda *args, **kwargs: (_ for _ in ()).throw(OSError("not ready")),
     )
-    monkeypatch.setattr(franzen_h200.time, "monotonic", lambda: next(clock, 12.0))
-    monkeypatch.setattr(franzen_h200.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(franzen_h200.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(franzen_h200.time, "sleep", clock.sleep)
     monkeypatch.setattr(franzen_h200, "_process_group_exists", lambda _process: group_alive[0])
 
     def signal_group(_process, sig: signal.Signals) -> None:
@@ -737,6 +990,65 @@ def test_readiness_does_not_stop_supervision_or_gpu_metrics(
     assert metrics_was_live_for_group_cleanup == [True]
 
 
+def test_readiness_retries_malformed_http_response(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from serving import franzen_h200
+
+    paths = _runtime_paths(tmp_path)
+    process = _FakeProcess((None, None, 0))
+    responses: list[object] = [
+        http.client.BadStatusLine("malformed"),
+    ]
+    request_count = 0
+
+    class Ready:
+        status = 200
+
+        def __enter__(self) -> Ready:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    responses.append(Ready())
+
+    def open_health(*_args, **_kwargs):
+        nonlocal request_count
+        request_count += 1
+        response = responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    monkeypatch.setattr(franzen_h200.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(franzen_h200, "_query_gpu", lambda: [])
+    monkeypatch.setattr(franzen_h200, "_process_group_exists", lambda _process: False)
+    monkeypatch.setattr(franzen_h200, "_signal_process_group", lambda *_args: None)
+    monkeypatch.setattr(
+        franzen_h200,
+        "_record_gpu_metrics",
+        lambda _path, stop: stop.wait(),
+    )
+    monkeypatch.setattr(franzen_h200.urllib.request, "urlopen", open_health)
+    monkeypatch.setattr(franzen_h200.time, "sleep", lambda _seconds: None)
+
+    result = _launch_and_wait(
+        paths=paths,
+        argv=("sglang", "serve", "--port", "8001"),
+        environment={},
+        notebook_start_epoch=1.0,
+        startup_timeout=30,
+        precache_cancel=threading.Event(),
+        cancellation=threading.Event(),
+        bind_host="127.0.0.1",
+    )
+
+    assert result == 0
+    assert request_count == 2
+
+
 def test_cancellation_reaps_the_owned_process_and_cancels_precache(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -820,7 +1132,22 @@ def test_draft_view_skips_unrelated_config_and_checks_links(tmp_path: Path) -> N
     assert (view / "model-00001.safetensors").resolve() == candidate / "model-00001.safetensors"
     assert json.loads((view / "config.json").read_text())["quantization_config"]["config_groups"]["mtp_routed_experts"]["weights"]["group_size"] == 32
     assert not (work / "model-00001.safetensors").exists()
-    bad_target = view / "model-00001.safetensors"
+    (view / "stale-extra.bin").write_bytes(b"stale")
+    with pytest.raises(ValueError, match="unexpected draft-view inventory"):
+        prepare_draft_view(target=target, source_root=source, work_root=work)
+    (view / "stale-extra.bin").unlink()
+
+    next_shard = candidate / "model-00002.safetensors"
+    next_shard.write_bytes(b"second shard")
+    (candidate / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"mtp.layers.0.mlp.experts.0.up_proj.weight": "model-00002.safetensors"}}),
+    )
+    updated_view = prepare_draft_view(target=target, source_root=source, work_root=work)
+    assert updated_view != view
+    assert (updated_view / "model-00002.safetensors").resolve() == next_shard
+    assert not (updated_view / "model-00001.safetensors").exists()
+
+    bad_target = updated_view / "model-00002.safetensors"
     bad_target.unlink()
     wrong_shard = candidate / "wrong.safetensors"
     wrong_shard.write_bytes(b"different shard")
@@ -914,6 +1241,13 @@ def test_invalid_model_config_fails_before_gpu_probe_or_install(
     (target / "config.json").write_text(
         json.dumps({"quantization_config": {"quant_method": "auto-round", "bits": 8}}),
     )
+    shared_cache = tmp_path / "shared-cache"
+    shared_cache.mkdir()
+    monkeypatch.setattr(
+        franzen_h200,
+        "h200_environment",
+        lambda *, base: {**base, "XDG_CACHE_HOME": str(shared_cache)},
+    )
     monkeypatch.setattr(franzen_h200, "_require_unoccupied_port", lambda *_args: None)
     monkeypatch.setattr(
         franzen_h200,
@@ -941,6 +1275,152 @@ def test_invalid_model_config_fails_before_gpu_probe_or_install(
                 "8001",
             ],
         )
+
+
+def test_full_serve_orchestration_rechecks_admission_then_launches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from serving import franzen_h200
+
+    wheelhouse = tmp_path / "bundle"
+    wheels = wheelhouse / "wheels"
+    wheels.mkdir(parents=True)
+    (wheels / "sglang-test.whl").write_bytes(b"wheel")
+    (wheelhouse / "requirements.lock").write_text("locked")
+    token_map = wheelhouse / "hot_tokens_64k.pt"
+    token_map.write_bytes(b"token map")
+    target = tmp_path / "target"
+    target.mkdir()
+    tokenizer = target / "tokenizer.json"
+    tokenizer.write_bytes(b"tokenizer")
+    (target / "config.json").write_text(
+        json.dumps({"quantization_config": {"quant_method": "auto-round", "bits": 4}}),
+    )
+    (target / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"target.weight": "target.safetensors"}}),
+    )
+    (target / "target.safetensors").write_bytes(b"target shard")
+    draft = tmp_path / "draft"
+    candidate = draft / "candidate"
+    candidate.mkdir(parents=True)
+    (candidate / "config.json").write_text(
+        json.dumps(
+            {
+                "quantization_config": {
+                    "quant_method": "compressed-tensors",
+                    "config_groups": {
+                        "mtp_routed_experts": {
+                            "weights": {
+                                "num_bits": 4,
+                                "group_size": 32,
+                                "symmetric": True,
+                            },
+                            "targets": ["RoutedExperts"],
+                        },
+                    },
+                    "ignore": [],
+                },
+            },
+        ),
+    )
+    (candidate / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "mtp.layers.0.mlp.experts.0.up_proj.weight": "draft.safetensors",
+                },
+            },
+        ),
+    )
+    (candidate / "draft.safetensors").write_bytes(b"draft shard")
+    shared_cache = tmp_path / "shared-cache"
+    shared_cache.mkdir()
+    monkeypatch.setenv("XDG_CACHE_HOME", str(shared_cache))
+    monkeypatch.setenv("SLURM_JOB_ID", "38700")
+    monkeypatch.setenv("SLURM_JOB_GPUS", "0")
+    monkeypatch.setattr(franzen_h200, "TOKEN_MAP_SHA256", _digest(token_map))
+    monkeypatch.setattr(franzen_h200, "TOKENIZER_SHA256", _digest(tokenizer))
+    monkeypatch.setattr(franzen_h200, "_require_unoccupied_port", lambda *_args: None)
+    gpu = parse_gpu_metrics("0, NVIDIA H200, 9.0, 143771, 615, 143156, 0, 75.72, 28\n")
+    gpu_calls = 0
+
+    def query_gpu() -> list[dict[str, object]]:
+        nonlocal gpu_calls
+        gpu_calls += 1
+        return gpu
+
+    events: list[str] = []
+    monkeypatch.setattr(franzen_h200, "_query_gpu", query_gpu)
+    monkeypatch.setattr(
+        franzen_h200,
+        "_precache_paths",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        franzen_h200,
+        "_setup_venv",
+        lambda *_args: events.append("setup") or {"mode": "installed"},
+    )
+    monkeypatch.setattr(
+        franzen_h200,
+        "apply_qsa_fp8_scratch_patch",
+        lambda *_args, **_kwargs: {"enabled": False, "status": "unpatched"},
+    )
+    monkeypatch.setattr(
+        franzen_h200,
+        "apply_qsa_mtp_hole_compaction_patch",
+        lambda *_args, **_kwargs: {"enabled": False, "status": "unpatched"},
+    )
+    monkeypatch.setattr(
+        franzen_h200,
+        "_qsa_source_file",
+        lambda _venv: tmp_path / "qwen_sparse_attn_backend.py",
+    )
+    monkeypatch.setattr(
+        franzen_h200,
+        "_prepare_cuda",
+        lambda _paths: (tmp_path / "cuda", "gcc", "g++"),
+    )
+    monkeypatch.setattr(
+        franzen_h200,
+        "_runtime_environment",
+        lambda *, base, **_kwargs: base,
+    )
+    monkeypatch.setattr(franzen_h200, "_run_logged", lambda *_args: "nvcc")
+
+    def write_metadata(**kwargs: object) -> None:
+        events.append("metadata")
+        admission = kwargs["admission"]
+        assert isinstance(admission, dict)
+        events.append(str(admission["slurm_job_id"]))
+
+    def launch(**_kwargs: object) -> int:
+        events.append("launch")
+        return 0
+
+    monkeypatch.setattr(franzen_h200, "_write_launch_metadata", write_metadata)
+    monkeypatch.setattr(franzen_h200, "_launch_and_wait", launch)
+    monkeypatch.setattr(franzen_h200.signal, "signal", lambda *_args: None)
+
+    result = main(
+        [
+            "--target-dir",
+            str(target),
+            "--draft-dir",
+            str(draft),
+            "--wheelhouse",
+            str(wheelhouse),
+            "--work-dir",
+            str(tmp_path / "work"),
+            "--port",
+            "8001",
+        ],
+    )
+
+    assert result == 0
+    assert gpu_calls == 2
+    assert events == ["setup", "metadata", "38700", "launch"]
 
 
 def test_fr_spec_assets_are_hash_checked(
@@ -1006,10 +1486,12 @@ def test_runtime_environment_keeps_shared_cache_paths_and_single_cuda_prefix(
 ) -> None:
     paths = _runtime_paths(tmp_path)
     cuda_home = tmp_path / "cuda"
+    shared_cache = tmp_path / "shared-xdg"
+    shared_cache.mkdir()
     environment = _runtime_environment(
         base={
             "HF_HOME": "/shared/hf",
-            "XDG_CACHE_HOME": "/shared/xdg",
+            "XDG_CACHE_HOME": str(shared_cache),
             "TRITON_CACHE_DIR": "/shared/triton",
             "TORCHINDUCTOR_CACHE_DIR": "/shared/inductor",
             "PATH": "/usr/bin",
@@ -1025,7 +1507,7 @@ def test_runtime_environment_keeps_shared_cache_paths_and_single_cuda_prefix(
     )
 
     assert environment["HF_HOME"] == "/shared/hf"
-    assert environment["XDG_CACHE_HOME"] == "/shared/xdg"
+    assert environment["XDG_CACHE_HOME"] == str(shared_cache)
     assert environment["TRITON_CACHE_DIR"] == "/shared/triton"
     assert environment["TORCHINDUCTOR_CACHE_DIR"] == "/shared/inductor"
     assert environment["PATH"].count(str(cuda_home / "bin")) == 1
@@ -1044,6 +1526,28 @@ def test_uv_binary_reuse_restores_executable_mode(tmp_path: Path) -> None:
     _extract_uv(wheel, destination)
 
     assert destination.stat().st_mode & stat.S_IXUSR
+
+
+def test_cuda_driver_link_repairs_dangling_symlink_and_is_repeatable(
+    tmp_path: Path,
+) -> None:
+    from serving.franzen_h200 import _ensure_libcuda_link
+
+    lib = tmp_path / "cuda/lib"
+    drivers = tmp_path / "drivers"
+    lib.mkdir(parents=True)
+    drivers.mkdir()
+    driver = drivers / "libcuda.so.1"
+    driver.write_text("driver")
+    link = lib / "libcuda.so"
+    link.symlink_to("missing-driver.so")
+
+    _ensure_libcuda_link(lib, driver_locations=(drivers,))
+
+    assert link.is_symlink()
+    assert link.resolve() == driver.resolve()
+    _ensure_libcuda_link(lib, driver_locations=(drivers,))
+    assert link.resolve() == driver.resolve()
 
 
 def test_metrics_continue_after_nvidia_smi_process_failure(
@@ -1078,6 +1582,64 @@ def test_metrics_continue_after_nvidia_smi_process_failure(
     assert "driver lost" in record["error"]
 
 
+def test_gpu_query_has_a_finite_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from serving import franzen_h200
+
+    observed: dict[str, object] = {}
+
+    def run(command, **kwargs):
+        observed["command"] = command
+        observed.update(kwargs)
+        return subprocess.CompletedProcess(command, 0, stdout="0, H200, 9.0, 100, 1, 99, 0, 40, 30\n")
+
+    monkeypatch.setattr(franzen_h200.subprocess, "run", run)
+
+    franzen_h200._query_gpu()
+
+    assert observed["timeout"] == franzen_h200.GPU_QUERY_TIMEOUT_SECONDS
+
+
+def test_metrics_record_nvidia_smi_timeout_and_continue(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from serving import franzen_h200
+
+    class OneTick(threading.Event):
+        def __init__(self) -> None:
+            super().__init__()
+            self.ticks = 0
+
+        def wait(self, timeout: float | None = None) -> bool:
+            del timeout
+            self.ticks += 1
+            return self.ticks > 1
+
+    monkeypatch.setattr(
+        franzen_h200,
+        "_query_gpu",
+        lambda: (_ for _ in ()).throw(
+            subprocess.TimeoutExpired(["nvidia-smi"], 30),
+        ),
+    )
+    path = tmp_path / "metrics.jsonl"
+
+    _record_gpu_metrics(path, OneTick())
+
+    record = json.loads(path.read_text())
+    assert record["phase"] == "runtime_error"
+    assert "timed out" in record["error"]
+
+
+@pytest.mark.parametrize(("returncode", "expected"), [(-9, 137), (-15, 143), (0, 0), (2, 2)])
+def test_signal_exit_status_is_normalized_for_shell(returncode: int, expected: int) -> None:
+    from serving.franzen_h200 import _normalize_server_exit_code
+
+    assert _normalize_server_exit_code(returncode) == expected
+
+
 def test_setup_failure_reports_bounded_command_output(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1085,16 +1647,96 @@ def test_setup_failure_reports_bounded_command_output(
     from serving import franzen_h200
 
     paths = _runtime_paths(tmp_path)
-    monkeypatch.setattr(
-        franzen_h200.subprocess,
-        "run",
-        lambda *args, **kwargs: subprocess.CompletedProcess(
-            args[0], 1, stdout="stdout evidence", stderr="stderr evidence",
-        ),
-    )
+    class FailedProcess:
+        def wait(self, *, timeout: float) -> int:
+            del timeout
+            return 1
+
+        def kill(self) -> None:
+            raise AssertionError("failed command should not be killed")
+
+    def popen(_command, *, stdout, **_kwargs):
+        stdout.write("stdout evidence\nstderr evidence\n")
+        stdout.flush()
+        return FailedProcess()
+
+    monkeypatch.setattr(franzen_h200.subprocess, "Popen", popen)
 
     with pytest.raises(RuntimeError, match="stderr evidence"):
         _run_logged(["false"], {}, paths)
+
+
+def test_setup_command_timeout_kills_child_after_streaming_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from serving import franzen_h200
+
+    paths = _runtime_paths(tmp_path)
+    timeouts: list[float] = []
+
+    class TimedOutProcess:
+        def wait(self, *, timeout: float) -> int:
+            timeouts.append(timeout)
+            if len(timeouts) == 1:
+                raise subprocess.TimeoutExpired(["synthetic"], timeout)
+            return -9
+
+        def kill(self) -> None:
+            return None
+
+    process = TimedOutProcess()
+
+    def popen(_command, *, stdout, **_kwargs):
+        stdout.write("streamed before timeout\n")
+        stdout.flush()
+        return process
+
+    monkeypatch.setattr(franzen_h200.subprocess, "Popen", popen)
+
+    with pytest.raises(RuntimeError, match="timed out"):
+        _run_logged(["synthetic"], {}, paths)
+
+    assert timeouts == [franzen_h200.SETUP_COMMAND_TIMEOUT_SECONDS, 10]
+    assert "streamed before timeout" in paths.log.read_text()
+
+
+def test_setup_command_keyboard_interrupt_reaps_its_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from serving import franzen_h200
+
+    paths = _runtime_paths(tmp_path)
+
+    class InterruptedProcess:
+        killed = False
+        waited = False
+
+        def wait(self, *, timeout: float) -> int:
+            del timeout
+            if not self.killed:
+                raise KeyboardInterrupt
+            self.waited = True
+            return -9
+
+        def kill(self) -> None:
+            self.killed = True
+
+    process = InterruptedProcess()
+
+    def popen(_command, *, stdout, **_kwargs):
+        stdout.write("setup output before interrupt\n")
+        stdout.flush()
+        return process
+
+    monkeypatch.setattr(franzen_h200.subprocess, "Popen", popen)
+
+    with pytest.raises(KeyboardInterrupt):
+        _run_logged(["synthetic"], {}, paths)
+
+    assert process.killed
+    assert process.waited
 
 
 def _option_value(arguments: tuple[str, ...], name: str) -> str:
@@ -1124,4 +1766,5 @@ def _runtime_paths(root: Path) -> RuntimePaths:
         install_metadata=work / "offline-install.json",
         metrics=work / "gpu-metrics.jsonl",
         pid_file=work / "server.pid",
+        lock_file=work / ".serve.lock",
     )

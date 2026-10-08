@@ -31,8 +31,12 @@ docker run --name penny-builder -it \
 
 Upload `out-penny/bundle-pennyroyal` as a Kaggle dataset. The builder checks a fresh offline installation before publishing the bundle. Model weights, tokenizer files, and the draft checkpoint are supplied separately. Use the [competition notebook](https://www.kaggle.com/code/dfranzen/arc-agi-3-milestone-2-solution) for the complete launch configuration.
 
+## Run launcher tests
+
+From the repository root, run `make -C serving test`. This uses the locked ARC3-Inference Python 3.12 test dependencies and runs the serving launcher and QSA probe CPU tests without a GPU or model download.
+
 ## Prefetch settings
 
 Enable prefetch with `--weight-loader-prefetch-checkpoints`. Lookahead is on by default; `SGLANG_WEIGHT_LOADER_PREFETCH_LOOKAHEAD=0` restores the original eager prefetch behavior.
 
-The patched prefetcher uses `--weight-loader-prefetch-num-threads` (default **4**) to read separate ranges of each shard, in **16 MiB** blocks by default (`SGLANG_PREFETCH_BLOCK_SIZE_MB`). It finishes staging the current shard before loading its tensors, then stages the next shard concurrently. It requires the standard safetensors mmap loader and replaces the independent eager prefetch pass. Disable any separate external prefetcher when using it.
+The patched prefetcher uses `--weight-loader-prefetch-num-threads` (default **4**) to read separate ranges of each shard, in **16 MiB** blocks by default (`SGLANG_PREFETCH_BLOCK_SIZE_MB`). It finishes staging the current shard before loading its tensors, then stages the next shard concurrently. It requires the standard safetensors mmap loader and replaces the independent eager prefetch pass for general deployments. The published competition notebook intentionally also starts its external background prefetcher while enabling `--weight-loader-prefetch-checkpoints`; the [write-up](../WRITEUP.md) records that paired configuration.
