@@ -194,8 +194,7 @@ def _run_probe(vendor_file: Path, *, diagnostic_output: Path) -> dict[str, objec
                 diagnostics=diagnostics,
             )
             diagnostics.update(selected)
-            _assert_gathered_scratch(torch, selected, initial_key, initial_value, case)
-            diagnostics["gather_verified"] = True
+            diagnostics["gather_verified"] = False
             reference = _bf16_attention_reference(
                 torch=torch,
                 queries=selected["queries"],
@@ -209,6 +208,8 @@ def _run_probe(vendor_file: Path, *, diagnostic_output: Path) -> dict[str, objec
             diagnostics["reference"] = reference
             max_abs_error = float((output.float() - reference.float()).abs().max())
             diagnostics["max_abs_error"] = max_abs_error
+            _assert_gathered_scratch(torch, selected, initial_key, initial_value, case)
+            diagnostics["gather_verified"] = True
             torch.testing.assert_close(output, reference, rtol=0.04, atol=0.04)
         except Exception as error:
             _write_failure_diagnostic(
